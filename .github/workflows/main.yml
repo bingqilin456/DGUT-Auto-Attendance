@@ -2,19 +2,34 @@ name: 学生助理考勤
 
 on:
   schedule:
-    - cron: '30 5,23 * * *'
+    # 注意：GitHub Actions 的 cron 一律使用 UTC。
+    # 23:30 UTC = 次日 07:30 北京时间；05:30 UTC = 13:30 北京时间。
+    - cron: '30 23 * * *'
+    - cron: '30 5 * * *'
+  # 允许在 Actions 页面手动触发，方便测试
+  workflow_dispatch:
 
 jobs:
   attendance:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
+    # 单个 job 硬上限是 360 分钟，这里留出余量
+    timeout-minutes: 350
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.7
+          python-version: '3.11'
+
       - name: Install requirements
         run: pip install -r requirements.txt
+
       - name: Attendance
-        run: python attendance.py -U ${{ secrets.USERNAME }} -P ${{ secrets.PASSWORD }} ${{ secrets.SERVER_KEY }}
+        run: |
+          python attendance.py \
+            -U "${{ secrets.USERNAME }}" \
+            -P "${{ secrets.PASSWORD }}" \
+            -K "${{ secrets.SERVER_KEY }}" \
+            --max-hours 5.5

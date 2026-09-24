@@ -1,229 +1,287 @@
+# 莞工学工系统 · 自动考勤
+
+莞工学工系统（[stu.dgut.edu.cn](https://stu.dgut.edu.cn/)）勤工助学岗位的自动打卡工具，适用于学生助理、助理班主任等职位的日常考勤：**该签到的时候自动签到，该签退的时候自动签退，避免"忘记打卡"和"打了卡忘记签退"。**
+
+> 本仓库基于 [Bertramoon/DGUT-Auto-Attendance](https://github.com/Bertramoon/DGUT-Auto-Attendance)
+> 重写。原版依赖的第三方库和页面路径在 2022 年之后就已全部失效，**2026 年直接使用原版是无法打卡的**，
+> 具体原因见 [第 2 节](#2-为什么原版失效了)。
+
+---
+
 # 1. 项目概述
 
-## 1.1. 简介
-&emsp;&emsp;Auto_Attendance实现莞工学工系统勤工俭学岗位自动打卡的功能，适用于各学生助理、助理班主任等勤工俭学职位的日常考勤打卡。**用以实现自动考勤，避免忘记打卡和打了卡但忘记签退等因“忘记”而引发的情况。**  
-&emsp;&emsp;由于定时任务太多，Github Actions会创建一个执行队列，因此经常会出现定时任务不在指定时间运行的情况，往往会有几分钟到几十分钟不等的延迟，尤其是在UTC16:00（即北京时间0:00)前后。此外，GitHub Actions本身的保护机制使得单个程序最大运行时间是360分钟。因此，为保证其稳定性，程序定时每天7:30和13:30启动，然后在python程序中设置简单的循环进行监控，在需要签到和签退的时刻运行签到和签退操作。除了可以设置个人的考勤时间外，还能设置是否在休息日（包括法定节假日）是否考勤。
+## 1.1. 工作原理
 
-## 1.2. 功能展示
-![功能展示](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Function%20display.png "")
+程序采取 **对账（reconciliation）** 的思路，而不是"到点触发一次"：
 
-## 1.3. 使用技术
-- Python3.7
-- Github Actions
-- 网络爬虫（主要是requests和解析库的使用）
-- 配置文件的基本知识
+```
+每轮循环：
+  1. 算出「此刻我应该在岗吗？」        ← 来自 schedule.json / special.json
+  2. 读服务端真实状态                  ← 学工系统上「上岗考勤」页面
+  3. 不一致才发动作（签到 / 签退）
+  4. 动作之后再读一次页面，确认真的生效
+```
 
-# 2. 部署
+这样做的好处是 **幂等 + 自愈**：
 
-## 2.1. fork仓库
+- GitHub Actions 排队、延迟、漏跑一轮，下一轮会自动补上；
+- 同一个时刻重复运行也不会重复打卡；
+- 每一次动作都有服务端返回的状态作为证据，不会出现"日志说成功、实际没打上"。
+
+## 1.2. 运行方式
+
+GitHub Actions 单个 job 最长只能跑 360 分钟，因此工作流每天启动两次
+（北京时间 **07:30** 和 **13:30**，对应 UTC 的 `23:30` 和 `05:30`），
+每次运行最长 5.5 小时，覆盖当天的考勤时段。
+
+---
+
+# 2. 为什么原版失效了
+
+原版 `attendance.py` 依赖 PyPI 上的 `dgut-requests`（**最后发布于 2022-10-04**），它有两个致命问题：
+
+## 2.1. 登录其实从未成功
+
+`dgut-requests` 的 `login()` 在向中央认证（CAS）提交时 **没有携带 `service` 参数**，
+于是 CAS 把登录票据发给了默认服务，而不是学工系统。
+
+随后它去访问学工系统时，服务器返回的 body 只有 152 字节的一段 **JavaScript 跳转**：
+
+```html
+<script>window.location.href='https://auth.dgut.edu.cn/authserver/login?service=...'</script>
+```
+
+`requests` 不会执行 JS，所以会话自始至终都没有建立起来。
+但库内部却无条件把 `is_authenticated` 置为 `True`，于是所有后续请求都静默失败。
+
+## 2.2. 无论成败都报告"签到成功"
+
+原库的 `attendance()` 方法拿到响应后 **不做任何校验**，直接返回 `"签到成功"`。
+所以日志里永远是成功，实际可能什么都没发生。
+
+## 2.3. 页面路径和表单都变了
+
+| 项目 | 2022 原版 | 现在（2026） |
+|---|---|---|
+| 勤工助学模块 | `/student/partwork/` | `/student/partWorkNew/` |
+| 考勤页面 | `attendance.jsp` | `attendancePre.jsp` |
+| 表单字段 | 单个 `session_token` | **同名 `session_token` 出现两次** |
+
+> 关于 `session_token`：页面上有两个同名的隐藏字段，浏览器会把两个都提交。
+> 用 `requests` 时如果用 `dict` 传参会丢掉一个，必须传 `list[tuple]`。
+> 这一点在 `attendance.py` 的 `_payload()` 里已经处理。
+
+## 2.4. 本仓库的做法
+
+- **不再依赖 `dgut-requests`**，登录逻辑重写在 `dgut_client.py` 里：
+  CAS 提交时直接带上 `service=https://stu.dgut.edu.cn/`，一次拿到有效会话；
+- 登录页解析改为 **逐个 `<input>` 解析**，而不是原库那种"一条按固定顺序跨 6 个字段的大正则"
+  （页面只要稍微重排，那种正则就会静默匹配失败）；
+- 每次动作之后 **重新读取页面确认状态**，没生效就抛异常。
+
+---
+
+# 3. 部署
+
+## 3.1. fork 仓库
+
 ![fork仓库](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Fork%20repository.png "")
 
-## 2.2. 设置Secrets
-![点击Settings](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Click%20Settings.png "")
+## 3.2. 设置 Secrets
 
-![添加secrets](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Click%20Secrets.png "")
+仓库 **Settings → Secrets and variables → Actions**，添加：
 
-<br>
+| Secret 名称 | 含义 | 必填 | 示例 |
+|---|---|:---:|---|
+| `USERNAME` | 中央认证账号（学号） | ✅ | `20xxxxxxxxx` |
+| `PASSWORD` | 中央认证密码 | ✅ | `********` |
+| `SERVER_KEY` | Server酱 SendKey（微信推送通知） | ❌ | `SCT123456...` |
 
-| 需要添加的repository secret |         含义         |      例      |
-| :-------------------------: | :------------------: | :----------: |
-|          USERNAME           | DGUT中央认证系统账号 | 20184141xxxx |
-|          PASSWORD           |         密码         |    123456    |
+> `SERVER_KEY` 只填 **SendKey 本身** 即可（例如 `SCT123456...`）。
+> 为兼容旧配置，填成 `-K SCT123456...` 这种写法程序也能识别。
 
-<br>
+## 3.3. 设置考勤时间（`schedule.json`）
 
-添加USERNAME
-![添加USERNAME](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Add%20username.png "")
+**不需要改 Python 代码**，只改 `schedule.json`：
 
-添加PASSWORD
-![添加PASSWORD](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Add%20password.png "")
+- key `"0"`–`"6"` 表示 **星期日 – 星期六**（每周第一天是星期日）；
+- value 是一个列表，每个元素是 `["开始时间", "结束时间"]`；
+- 时间必须严格写成 `"时:分"`（`"8:30"` 可以，`"8:3"`、`"8:30:00"` 不行）；
+- 空列表 `[]` 表示当天不考勤。
 
-添加成功
-![添加secret成功](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Set%20secrets%20success.png "")
+```json
+{
+    "0": [],
+    "1": [["8:30", "12:00"], ["14:30", "16:00"]],
+    "2": [["8:30", "12:00"]],
+    "3": [],
+    "4": [["8:30", "10:10"]],
+    "5": [["10:25", "12:00"]],
+    "6": []
+}
+```
 
-## 2.3. 设置考勤时间
+上表含义：周日、周三、周六不考勤；周一是 `8:30-12:00` 和 `14:30-16:00` 两段；
+以此类推。
 
->**设置考勤时间不需要编辑python代码，仅需要编辑schedule.json文件**  
->&emsp;&emsp;在schedule.json文件中，**"0"-"6"表示星期日-星期六**（每周的第一天是星期日），其映射的列表表示考勤时间  
->&emsp;&emsp;考勤时间列表的每一个元素亦是一个列表，代表一次考勤的开始时间和结束时间，下面这个例子能让你更加清楚如何制定自己的考勤时间表  
->>*Tips:*
-*不要更改schedule.json的文件结构；时间要严格按照"时:分"的格式，不要精确到秒。否则将造成程序无法正常运行*
+## 3.4. 某一天特殊安排（`special.json`）
 
-<br>
+需要单独调整**某一天**时用这个文件，格式是 `"年-月-日": [[开始, 结束]]`。
+**只要某天出现在这个文件里，就以它为准**，同时也会忽略"节假日不打卡"的判断。
 
-**schedule.json**
+```json
+{
+    "2026-10-01": [],
+    "2026-10-08": [["9:00", "11:30"]]
+}
+```
 
-    {
-        "0": [
+- `"2026-10-01": []` → 这天不打卡（国庆）；
+- `"2026-10-08": [["9:00", "11:30"]]` → 这天改在 9:00–11:30 打卡。
 
-        ],
-        "1": [
-            ["8:30", "10:10"],
-            ["14:30", "17:30"]
-        ],
-        "2": [
-            ["8:30", "12:00"]
-        ],
-        "3": [
-            ["14:30", "17:30"]
-        ],
-        "4": [
-            ["8:30", "10:10"]
-        ],
-        "5": [
-            ["14:30", "17:00"]
-        ],
-        "6": [
-            
-        ]
-    }
+## 3.5. 配置 `config.ini`
 
-<br>
+```ini
+[attendance]
+holiday_attendance = True
+workAssignmentId = 38605
+```
 
-上面这段json代码的意思是：
-|  星期  |         考勤时间          |
-| :----: | :-----------------------: |
-| 星期日 |             -             |
-| 星期一 | 8:30-10:10<br>14:30-17:30 |
-| 星期二 |        8:30-12:00         |
-| 星期三 |        14:30-17:30        |
-| 星期四 |        8:30-10:10         |
-| 星期五 |        14:30-17:30        |
-| 星期六 |             -             |
+- **`holiday_attendance`**：`True` = 法定节假日也照常打卡；`False` = 跳过节假日。
+- **`workAssignmentId`**：考勤职位的 ID。只有一个职位时可以留空（自动取第一个）；
+  有多个职位时必须指定，否则会打错岗位。
 
-<br>
+> 查看自己的 `workAssignmentId`：登录学工系统 → **勤工助学 → 上岗考勤**，
+> 页面上的"工作考勤"下拉框里，`<option value="38605">计算机学院学生工作助理</option>`
+> 中的数字就是它。本仓库已按当前账号填好（`38605`）。
 
-*按照自己的需求设置即可，下面我们来对schedule.json进行在线编辑*
+## 3.6. 开启 Actions
 
-<br>
+仓库 **Actions** 页面 → 启用 workflow。
+工作流也可以 **手动触发**（`workflow_dispatch`），方便测试。
 
-点击schedule.json
-![点击schedule.json](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Click%20schedule.png "")
+---
 
-编辑schedule.json
-![编辑schedule.json](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Edit%20schedule.png "")
+# 4. 本地运行与测试
 
-提交修改，成功设置考勤时间
-![提交修改](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Set%20schedule.png "")
+```bash
+pip install -r requirements.txt
 
-## 2.4. * 配置config.ini
+# 只看状态，不打卡
+python dgut_client.py state -U <学号> -P <密码>
 
-config.ini一般不需要进行配置。该文件下有两个参数：
-- holiday_attendance：
-bool类型，设置休息日及法定节假日是否考勤，True则考勤，False则不考勤，默认为False
-- workAssignmentId：
-int类型，设置考勤职位的ID，当你有2个职位的时候可能会用到该参数
+# 手动签到 / 签退
+python dgut_client.py in  -U <学号> -P <密码>
+python dgut_client.py out -U <学号> -P <密码>
 
-<br>
+# 完整跑一遍主程序（--dry-run 只报告、不真的打卡）
+python attendance.py -U <学号> -P <密码> --dry-run --once
+python attendance.py -U <学号> -P <密码> --once
+```
 
-*如果有多个职位，需要指定具体某一个职位；或者想要提高运行效率，可以配置一下workAssignmentId*  
-*以下是配置方法。若无需配置，[跳到下一节](#25-开启Actions定时任务)*
+也可以把账号放在环境变量里，避免出现在命令行历史中：
 
-首先登录[学工系统](http://stu.dgut.edu.cn/homepage.jsp)，来到考勤页面，并按F12打开开发者工具
-![登录学工系统，来到上岗考勤页面，打开开发者工具](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Search%20workAssignmentId_1.png "")
+```bash
+export DGUT_USERNAME=20xxxxxxxxx
+export DGUT_PASSWORD=********
+python dgut_client.py state
+```
 
-搜索workAssignmentId
-![按Ctrl+F打开搜索框，输入workAssignmentId进行搜索，找到"请选择工作考勤"](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Search%20workAssignmentId_2.png "")
+## 常用参数
 
-双击select标签，找到workAssignmentId
-![双击select标签](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Search%20workAssignmentId_3.png "")
-![找到workAssignmentId](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Search%20workAssignmentId_4.png "")
+| 参数 | 说明 |
+|---|---|
+| `--once` | 只做一轮对账就退出（适合手动测试、或高频 cron） |
+| `--dry-run` | 只打印"将要做什么"，不真正打卡 |
+| `--interval` | 对账间隔秒数，默认 `600`；到达考勤时刻会提前唤醒 |
+| `--max-hours` | 单次运行最长小时数，默认 `5.5`（Actions 上限 6 小时） |
+| `--schedule` / `--special` / `--config` | 指定配置文件路径 |
+| `-W` | 指定 `workAssignmentId`，优先级高于 `config.ini` |
 
-<br>
+---
 
-假设网安学院学生工作助理的workAssignmentId=9200。那么，config.ini文件应该这么写
-
-    [attendance]
-    holiday_attendance = False
-    workAssignmentId = 9200
-
-<br>
-
-*文件在线配置的方法可参考[2.3. 设置考勤时间](#23-设置考勤时间)*
-
-
-## 2.5. 开启Actions定时任务
-点击Actions，启动工作流  
-![点击Actions开启工作流](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Start%20action.png "")
-![手动开启该定时任务](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Manual%20start.png "")
-
-启动成功！  
-![点击Enable workflow](https://gitee.com/bertramoon/img/raw/master/Auto_Attendance/Action%20success.png "")
-
-
-## *2.6. 开启微信消息通知*
-
-需要配置Server酱获取对应的key，再将key配置到Secrets，[详细配置教程戳这里](https://gitee.com/bertramoon/dgut-autoreport-configure/blob/master/README.md#3-%E5%BE%AE%E4%BF%A1%E6%B6%88%E6%81%AF%E6%8E%A8%E9%80%81%E6%89%93%E5%8D%A1%E6%88%90%E5%8A%9F%E9%80%9A%E7%9F%A5%E9%85%8D%E7%BD%AE )
-
-**注：因为自动考勤不支持多账号，因为在配置key时，只需要设置Secrets的变量名为SERVER_KEY，值为`-K <key>`即可**，例如`-K fgasd12`
-
-# 3. 项目结构
+# 5. 项目结构
 
 ```
-Auto_Attendance
-│  attendance.py
-│  config.ini
-│  log.yaml
+DGUT-Auto-Attendance
+│  attendance.py        主程序：读取计划 + 对账循环
+│  dgut_client.py       学工系统客户端：CAS 登录、读状态、签到、签退
+│  config.ini           节假日是否打卡、考勤职位 ID
+│  schedule.json        每周考勤时间表
+│  special.json         某一天的特殊考勤安排
+│  requirements.txt     依赖
 │  README.md
-│  requirements.txt
-│  schedule.json
-│  special.json
 │
-└─.github
-    └─workflows
-            main.yml
+└─.github/workflows/
+      main.yml          GitHub Actions 工作流
 ```
 
-- attendance.py:
-主程序
-- config.ini:
-关于休息日是否考勤、考勤职位ID等信息的配置文件
-- README.md:
-项目说明
-- requirements.txt:
-运行程序所需的python第三方库及使用版本
-- schedule.json:
-考勤时间配置文件
-- special.json:
-考勤特殊情况，用于更改具体某一天的考勤安排
-- .github/workflows/main.yml:
-YAML文件，创建github action的工作流workflows
+依赖只有三个：`requests`、`pycryptodome`（CAS 密码加密）、`chinesecalendar`（节假日判断，可选）。
 
+---
 
-# 4. 常见问题
+# 6. 常见问题
 
-## 4.1. 设置8:30-12:00考勤，但工作流提前几十分钟就开始启动？
->Github Actions经常性不会准时开启定时任务，通常延迟几分钟到几十分钟才运行，因此程序设置了7:30和13:30的定时任务（因为GitHub Actions限制每个程序只能运行6个小时，因此分两次运行），在程序上设置时间监控进行考勤
+## 6.1. 设置了 8:30 打卡，为什么工作流 7:30 就启动了？
 
-<br>
+GitHub Actions 的定时任务**经常延迟几分钟到几十分钟**才真正开始运行。
+所以工作流提前启动，启动后由程序自己等待到考勤时刻再打卡。
+这也正是采用"对账循环"的原因：无论何时启动，只要启动时还没错过打卡时刻（或刚好在时段内），都能正确打卡。
 
-## 4.2. 使用这个程序会泄露我的个人账号/密码吗？
->账号和密码是使用Github Actions Secrets保存，安全性由Github及其安全算法来保障。不能说万无一失，只能说安全性还是有保障的。如果你有一台一直在运行的电脑，直接本地运行会更具安全性，但相应地也失去便捷性
+## 6.2. 会不会泄露我的账号密码？
 
+账号密码保存在 GitHub Actions Secrets 中，由 GitHub 保管，不会出现在仓库文件或日志里。
+如果有一台长期开机的电脑，本地运行同样可行（`python attendance.py --once` 配合系统计划任务）。
 
-<br>
-- 有需求或技术方面的问题请联系作者Email：3233406405@qq.com
+## 6.3. 打卡时段中途程序退出了，会不会一直留在"在岗"状态？
 
-# 5. 参考资料
+不会。下次运行时会自动收尾：
 
-- [莞工自动打卡&nbsp;&nbsp;Auto_Daily_Attendance-rebuild-](https://github.com/RanegadeHRH/Auto_Daily_Attendance-rebuild-/tree/ForWorkflow "莞工每日疫情打卡 - github仓库")
+- 若这条"在岗"记录是**更早的日期**开的，或**今天已经有考勤时段结束过**，程序会自动签退；
+- 若都不满足（例如用户在非考勤时段自己手动签了到），程序会 **保持原样并打印原因**，
+  不会贸然替你签退，以免破坏真实工时。
 
-- [YAML语言教程](http://www.ruanyifeng.com/blog/2016/07/yaml.html "YAML 语言教程 - 阮一峰的网络日志")
+## 6.4. 学校又改版了怎么办？
 
-- [GitHub Actions 入门教程](http://www.ruanyifeng.com/blog/2019/09/getting-started-with-github-actions.html "GitHub Actions 入门教程 - 阮一峰的网络日志")
+页面结构变化时，程序会抛出 `PageChangedError` 或 `DgutError` 并在日志里说明具体哪个字段没找到，
+而不是像原版那样静默地"假装成功"。看到这类报错就说明该更新解析逻辑了。
 
+---
+
+# 7. 更新日志
+
+## 2026 重写版
+
+- **重写登录逻辑**：不再依赖已停更的 `dgut-requests`，CAS 提交时携带 `service`，
+  修复"会话从未建立却被标记为已登录"的问题；
+- **适配新版页面**：`/student/partwork/` → `/student/partWorkNew/attendancePre.jsp`，
+  处理页面上重复出现的 `session_token`；
+- **改为对账循环**：幂等、可自愈，漏跑能补，重复运行不会重复打卡；
+- **动作后校验状态**：不再无条件报告成功；
+- **安全签退**：不会误签退用户自己手动开的在岗记录；
+- **更新 CI**：`ubuntu-18.04` + Python 3.7（均已不可用）→ `ubuntu-latest` + Python 3.11，
+  Actions 版本升级到 `checkout@v4` / `setup-python@v5`，并支持手动触发。
+
+## v2022-2-1（原版）
+
+- 修复 bug；添加 Server酱消息通知功能。
+
+## v2022-1-31（原版）
+
+- 重构 `attendance.py`，改用 `schedule` 定时替代 `sleep` 阻塞；
+- 设置虚拟环境为 `ubuntu-18.04`。
+
+---
+
+# 8. 参考资料
+
+- [原仓库 Bertramoon/DGUT-Auto-Attendance](https://github.com/Bertramoon/DGUT-Auto-Attendance)
 - [chinesecalendar · PyPI](https://pypi.org/project/chinesecalendar/)
+- [GitHub Actions 入门教程](http://www.ruanyifeng.com/blog/2019/09/getting-started-with-github-actions.html)
 
-- [dgut-requests · PyPI](https://pypi.org/project/dgut-requests/)
+---
 
-# 6. 更新日志
+# 9. 致谢
 
-## v2022-2-1
-
-- 修复bug
-- 添加Server酱消息通知功能
-
-## v2022-1-31
-
-- 重构项目代码(attendance.py)，使用schedule实现定时用以替代简单的sleep阻塞
-- 设置虚拟环境为ubuntu-18.04，修正了因openssl版本问题访问不到学校网站的问题
+原项目作者：**3233406405@qq.com**（[Bertramoon](https://github.com/Bertramoon)）。
+本仓库在其基础上适配 2026 年的学工系统。
