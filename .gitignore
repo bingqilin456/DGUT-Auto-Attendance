@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# 本机账号密码（桌面版保存的），绝不上传
+account.ini
+crash.log

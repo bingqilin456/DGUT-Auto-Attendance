@@ -93,6 +93,40 @@ def get_config(filename: str | Path = "config.ini") -> dict:
     return demand
 
 
+def _read_json_map(filename: str | Path) -> dict | None:
+    """读一个 JSON 对象；读失败返回 ``None``（同时记一条日志）。"""
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log(f"没找到文件 {filename}")
+        return None
+    except json.JSONDecodeError as exc:
+        log(f"文件 {filename} 不是合法 JSON：{exc}")
+        return None
+    if not isinstance(data, dict):
+        log(f"文件 {filename} 的顶层必须是 JSON 对象，已忽略")
+        return None
+    return data
+
+
+def _parse_windows(day_prefix: str, items) -> list[list[datetime]]:
+    """把 ``[["8:30", "12:00"], ...]`` 解析成 ``[[start, end], ...]``。"""
+    plan: list[list[datetime]] = []
+    for item in items:
+        try:
+            start, end = (datetime.strptime(day_prefix + t, "%Y-%m-%d %H:%M") for t in item)
+        except (TypeError, ValueError) as exc:
+            log(f"考勤时间段 {item!r} 格式不合法，已跳过（{exc}）")
+            continue
+        if end <= start:
+            log(f"考勤时间段 {start:%H:%M}-{end:%H:%M} 的签退时间不晚于签到时间，已跳过")
+            continue
+        plan.append([start, end])
+    plan.sort()
+    return plan
+
+
 def get_schedule(filename: str | Path, flag: int, now: datetime | None = None) -> list[list[datetime]]:
     """读取今天的考勤时间表。
 
@@ -103,16 +137,12 @@ def get_schedule(filename: str | Path, flag: int, now: datetime | None = None) -
 
     Returns:
         ``[[start, end], ...]``，可能为空列表；时间已按起点排序。
+        这一天没出现在文件里、或者写的就是空列表，都会得到空列表；
+        需要区分这两种情况时请用 :func:`get_special_schedule`。
     """
     now = now or beijing_naive()
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        log(f"没找到文件 {filename}")
-        return []
-    except json.JSONDecodeError as exc:
-        log(f"文件 {filename} 不是合法 JSON：{exc}")
+    data = _read_json_map(filename)
+    if data is None:
         return []
 
     key = now.strftime("%w") if flag == 1 else now.strftime("%Y-%m-%d")
@@ -120,21 +150,31 @@ def get_schedule(filename: str | Path, flag: int, now: datetime | None = None) -
     if not today:
         return []
 
-    day_prefix = now.strftime("%Y-%m-%d ")
-    plan: list[list[datetime]] = []
-    for item in today:
-        try:
-            start, end = (datetime.strptime(day_prefix + t, "%Y-%m-%d %H:%M") for t in item)
-        except (TypeError, ValueError) as exc:
-            log(f"考勤时间段 {item!r} 格式不合法，已跳过（{exc}）")
-            continue
-        if end <= start:
-            log(f"考勤时间段 {start:%H:%M}-{end:%H:%M} 的签退时间不晚于签到时间，已跳过")
-            continue
-        plan.append([start, end])
+    return _parse_windows(now.strftime("%Y-%m-%d "), today)
 
-    plan.sort()
-    return plan
+
+def get_special_schedule(filename: str | Path, now: datetime | None = None) -> list[list[datetime]] | None:
+    """读取某一天在 ``special.json`` 里的特殊安排。
+
+    它和 :func:`get_schedule` 的关键区别是 **能区分「没表态」和「明确不考勤」**：
+
+    Returns:
+        ``None``                —— 这天根本没出现在文件里，请按星期表走；
+        ``[]``                  —— 这天写了空列表，意思是 **当天不考勤**；
+        ``[[start, end], ...]`` —— 这天的临时安排，直接覆盖星期表。
+    """
+    now = now or beijing_naive()
+    data = _read_json_map(filename)
+    if data is None:
+        return None
+
+    key = now.strftime("%Y-%m-%d")
+    if key not in data:
+        return None
+    today = data[key]
+    if not today:
+        return []
+    return _parse_windows(now.strftime("%Y-%m-%d "), today)
 
 
 # --------------------------------------------------------------------------- #
@@ -231,9 +271,13 @@ def reconcile_once(
     return action
 
 
-def should_skip_today(config: dict, special: list[list[datetime]]) -> str | None:
-    """判断今天是否需要整体跳过，返回跳过原因。"""
-    if config["holiday_attendance"] or special:
+def should_skip_today(config: dict, special: list[list[datetime]] | None) -> str | None:
+    """判断今天是否需要整体跳过，返回跳过原因。
+
+    ``special`` 传 :func:`get_special_schedule` 的结果：只要这一天在 special.json
+    里出现过（哪怕是空列表），就以它为准，不再套用节假日判断。
+    """
+    if config["holiday_attendance"] or special is not None:
         return None
     if _calendar is None:
         return None  # 装不上 chinesecalendar 时，宁可打卡也不要漏
@@ -289,13 +333,15 @@ def main(argv: list[str] | None = None) -> int:
     config = get_config(args.config)
     waid = _resolve_work_assignment_id(args.work_assignment_id, config)
 
-    special = get_schedule(args.special, 2)
+    special = get_special_schedule(args.special)
     skip_reason = should_skip_today(config, special)
     if skip_reason:
         log(f"[程序结束] {skip_reason}")
         return 0
 
-    plan = special if special else get_schedule(args.schedule, 1)
+    # special 为 None 表示「今天没特殊安排」，才轮到星期表；
+    # 空列表 [] 是明确表态「今天不考勤」，不能再退回星期表去打卡。
+    plan = special if special is not None else get_schedule(args.schedule, 1)
     log(f"[程序启动] 北京时间 {beijing_naive():%Y-%m-%d %H:%M:%S}")
     if plan:
         for start, end in plan:
