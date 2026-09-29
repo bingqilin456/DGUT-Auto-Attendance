@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from random import choices
@@ -51,6 +52,12 @@ _SALT_CHARS = "ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678"
 _RANDOM_PREFIX_LEN = 64
 
 BEIJING_TZ = timezone(timedelta(hours=8))
+
+# 网络抖动重试：校园网 / 云主机偶发读超时，一次失败不该毁掉整轮打卡
+# （2026-09-29 就因为没有重试、且调用方只捕获 DgutError，一次 ReadTimeout
+#   让进程直接崩掉，会话挂着没人签退，凭空多算了 6.79 小时工时）
+REQUEST_RETRIES = 3
+RETRY_BACKOFF = 5.0
 
 
 def beijing_now() -> datetime:
@@ -196,7 +203,7 @@ class XgxtClient:
         login_url = f"{AUTH_URL}?service={requests.utils.quote(service, safe='')}"
         referer_headers = {"Referer": login_url, "Origin": "https://auth.dgut.edu.cn"}
 
-        resp = self.session.get(login_url, timeout=self.timeout)
+        resp = self._request("GET", login_url)
         if resp.status_code != 200:
             raise LoginError(f"打开中央认证登录页失败：HTTP {resp.status_code}")
 
@@ -230,10 +237,7 @@ class XgxtClient:
             "lt": by_id.get("lt", ""),
         }
 
-        resp = self.session.post(
-            login_url, data=data, headers=referer_headers,
-            timeout=self.timeout, allow_redirects=True,
-        )
+        resp = self._request("POST", login_url, data=data, headers=referer_headers)
         if resp.status_code == 401 or "密码错误" in resp.text or "用户名或密码" in resp.text:
             raise LoginError("账号或密码错误")
         if not resp.history and "authserver/login" in resp.url:
@@ -260,24 +264,52 @@ class XgxtClient:
             self.login()
 
     # ------------------------------------------------------------ HTTP 层 --
+    def _request(self, method: str, url: str, *, headers=None, data=None):
+        """带重试的请求。
+
+        网络层的异常（超时、连接被重置）统一转成 :class:`DgutError`，
+        这样调用方只需要捕获一种异常，不会像以前那样把 ``ReadTimeout``
+        漏出去、把整个进程搞崩。
+        """
+        last: Exception | None = None
+        for attempt in range(1, REQUEST_RETRIES + 1):
+            try:
+                resp = self.session.request(
+                    method, url, timeout=self.timeout, headers=headers, data=data)
+            except requests.RequestException as exc:
+                last = exc
+                if attempt < REQUEST_RETRIES:
+                    time.sleep(RETRY_BACKOFF * attempt)
+                    continue
+            else:
+                # 5xx 多半是服务端打了个嗝，值得再试；4xx 直接返回给上层判断
+                if resp.status_code < 500 or attempt == REQUEST_RETRIES:
+                    return resp
+                last = DgutError(f"HTTP {resp.status_code}")
+                time.sleep(RETRY_BACKOFF * attempt)
+        raise DgutError(
+            f"网络请求失败（已重试 {REQUEST_RETRIES} 次）："
+            f"{type(last).__name__}: {last}"
+        ) from last
+
     def _get(self, path: str) -> str:
         self._ensure_login()
         url = path if path.startswith("http") else BASE_URL + path
-        resp = self.session.get(url, timeout=self.timeout)
+        resp = self._request("GET", url)
         if resp.status_code != 200:
             raise DgutError(f"GET {path} 失败：HTTP {resp.status_code}")
         # 会话过期时系统会返回一段 JS 跳转，这里做一个兜底重建
         if "authserver/login" in resp.text and len(resp.text) < 600:
             self.logged_in = False
             self.login()
-            resp = self.session.get(url, timeout=self.timeout)
+            resp = self._request("GET", url)
         return resp.text
 
     def _post(self, path: str, data: list[tuple[str, str]]) -> str:
         self._ensure_login()
         url = path if path.startswith("http") else BASE_URL + path
-        resp = self.session.post(
-            url, data=data, timeout=self.timeout,
+        resp = self._request(
+            "POST", url, data=data,
             headers={"Referer": url, "Origin": BASE_URL},
         )
         if resp.status_code != 200:

@@ -45,6 +45,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INTERVAL = 600
 # GitHub Actions 单个 job 上限 6 小时，留一点余量。
 DEFAULT_MAX_HOURS = 5.5
+# 到达运行时间上限时，若当前时段的结束就在眼前，就多撑这几分钟把签退做完，
+# 免得带着「在岗」状态退出、让工时一直涨到下一次运行才发现。
+MAX_EXTENSION_MIN = 20
 
 
 # --------------------------------------------------------------------------- #
@@ -351,10 +354,19 @@ def main(argv: list[str] | None = None) -> int:
     log(f"  考勤职位：{waid or '（取列表中第一个）'}{'  [dry-run]' if args.dry_run else ''}")
 
     client = XgxtClient(args.username, args.password)
-    try:
-        client.login()
-    except DgutError as exc:
-        log(f"[登录失败] {exc}")
+    login_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            client.login()
+            login_error = None
+            break
+        except DgutError as exc:
+            login_error = exc
+            log(f"[登录失败 第 {attempt}/3 次] {exc}")
+            if attempt < 3:
+                time.sleep(30)
+    if login_error is not None:
+        log("[程序结束] 连续 3 次都没登上，本次运行放弃（没有产生任何考勤记录）")
         return 1
     log("[登录成功]")
 
@@ -365,9 +377,12 @@ def main(argv: list[str] | None = None) -> int:
         now = beijing_naive()
         try:
             reconcile_once(client, waid, plan, key=key, dry_run=args.dry_run)
-        except DgutError as exc:
-            # 单轮失败不致命：下一轮对账会自然重试
-            log(f"[本轮对账失败] {exc}")
+        except Exception as exc:
+            # 单轮失败不致命：下一轮对账会自然重试。
+            # 这里必须捕获 Exception 而不只是 DgutError —— 一旦漏出去进程就会
+            # 直接崩掉，而此时可能正处于「已签到」状态，会话就挂在那儿没人签退，
+            # 工时一直涨到下一次运行才发现（2026-09-29 就因此多算了 6.79 小时）。
+            log(f"[本轮对账失败] {type(exc).__name__}: {exc}")
 
         if args.once:
             break
@@ -381,11 +396,24 @@ def main(argv: list[str] | None = None) -> int:
             # 再对账一次，确保不会带着「在岗」状态退出。
             try:
                 reconcile_once(client, waid, plan, key=key, dry_run=args.dry_run)
-            except DgutError as exc:
-                log(f"[收尾对账失败] {exc}")
+            except Exception as exc:
+                log(f"[收尾对账失败] {type(exc).__name__}: {exc}")
             log("[程序结束] 今日考勤时段已全部结束")
             break
+
         if time.monotonic() >= deadline:
+            # 到点了。如果当前时段马上就要结束，就多撑一小会儿把签退做完；
+            # 否则如实记一笔「还开着」，交给下一次运行收尾。
+            current_end = next((e for s, e in plan if s <= now < e), None)
+            remaining = (current_end - now).total_seconds() if current_end else None
+            if remaining is not None and 0 < remaining <= MAX_EXTENSION_MIN * 60:
+                log(f"[延长运行] 当前时段 {current_end:%H:%M} 即将结束，"
+                    f"多等 {remaining / 60:.0f} 分钟把签退做完")
+                deadline = time.monotonic() + remaining + 60
+                time.sleep(min(remaining + 60, 300))
+                continue
+            log(f"[警告] 已到运行时间上限，但当前仍在考勤时段内（{now:%H:%M}）："
+                "本次运行不会在这里签退，留待下一次运行收尾")
             log("[程序结束] 已达本次运行时间上限")
             break
 
