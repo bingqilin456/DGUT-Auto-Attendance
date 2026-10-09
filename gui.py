@@ -463,8 +463,25 @@ class Dashboard:
 
         client = self._connect(username, password)
         points = core.boundaries(plan)
+        plan_date = core.beijing_naive().date()
 
         while not self.stop_flag.is_set():
+            # 跨过午夜后必须重新读「今天」的排班：桌面版常常整夜开着，
+            # 否则第二天会拿着昨天的时段表空转，该签到的时候一声不响。
+            today = core.beijing_naive().date()
+            if today != plan_date:
+                plan_date = today
+                try:
+                    plan = today_plan()
+                except Exception as exc:
+                    self.events.put(("log", f"[读取排班失败] {exc}"))
+                    plan = []
+                points = core.boundaries(plan)
+                self.events.put(("log", f"[跨天] 进入 {today:%Y-%m-%d}，重新读取排班"))
+                if not plan:
+                    self.events.put(("log", "[程序结束] 今日没有考勤安排"))
+                    break
+
             try:
                 core.reconcile_once(client, waid, plan)
                 self._report_state(client.get_attendance_state(waid))

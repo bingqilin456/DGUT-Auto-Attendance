@@ -131,6 +131,25 @@ def _enabled_buttons(html: str) -> list[tuple[str, str]]:
     return out
 
 
+def _looks_like_login_page(resp: requests.Response) -> bool:
+    """判断这次响应是不是被踢回中央认证登录页了。
+
+    会话过期时学工系统有两种表现：
+
+    1. 返回一段短小的 JS 跳转，正文里出现 ``authserver/login``；
+    2. requests 自动跟随跳转，直接拿到那张 19 KB 的登录页 —— 此时
+       ``resp.url`` 会落在 authserver 上，正文里有 ``pwdEncryptSalt``。
+
+    第二种以前没被识别，于是「状态读回来是未签到、动作却发不出去」，
+    每轮都以一堆看不懂的解析错误收场。两种都识别出来才能自己重建会话。
+    """
+    if "authserver/login" in resp.url:
+        return True
+    if len(resp.text) < 600 and "authserver/login" in resp.text:
+        return True
+    return "pwdEncryptSalt" in resp.text
+
+
 # --------------------------------------------------------------------------- #
 # 数据模型
 # --------------------------------------------------------------------------- #
@@ -203,22 +222,9 @@ class XgxtClient:
         login_url = f"{AUTH_URL}?service={requests.utils.quote(service, safe='')}"
         referer_headers = {"Referer": login_url, "Origin": "https://auth.dgut.edu.cn"}
 
-        resp = self._request("GET", login_url)
-        if resp.status_code != 200:
-            raise LoginError(f"打开中央认证登录页失败：HTTP {resp.status_code}")
-
-        inputs = _parse_inputs(resp.text)
-        by_id: dict[str, str] = {}
-        for item in inputs:
-            if item["id"] and item["id"] not in by_id:
-                by_id[item["id"]] = item["value"]
-
-        salt = by_id.get("pwdEncryptSalt")
-        execution = by_id.get("execution")
-        if not salt or not execution:
-            raise PageChangedError(
-                "中央认证登录页结构已变化，未找到 pwdEncryptSalt / execution 字段"
-            )
+        inputs, by_id = self._fetch_login_form(login_url)
+        salt = by_id["pwdEncryptSalt"]
+        execution = by_id["execution"]
 
         # 页面上有 4 个登录区块（fido/短信/账号密码/扫码），只有账号密码区块的
         # cllt 是 userNameLogin，必须挑对，否则会被当成其它登录方式。
@@ -243,6 +249,47 @@ class XgxtClient:
         if not resp.history and "authserver/login" in resp.url:
             raise LoginError("登录未跳转，账号或密码可能不正确")
         self.logged_in = True
+
+    def _fetch_login_form(self, login_url: str) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """取登录表单，返回 ``(所有 input, 按 id 索引的 input)``。
+
+        这里有个坑，2026-10-08 的线上事故正是它造成的：
+
+        CAS 只要还认得当前会话（会话里留着 CASTGC），
+        ``GET /authserver/login?service=…`` 就会直接 302 回业务系统，返回的 HTML
+        里既没有 ``pwdEncryptSalt`` 也没有 ``execution``。于是「会话过期 → 重新登录」
+        一路失败，程序只报一句「登录页结构已变化」，之后每一轮重试都是同样的结果。
+        10-08 15:00 服务端抖了一下之后，两次运行就这样瞎了 80 分钟，
+        17:00 的签退也因此彻底丢掉（那天的工时于是变成 14:30~21:00 一条 6.5 小时）。
+
+        所以取表单之前先清掉旧的认证 cookie，让 CAS 老老实实把登录页给出来；
+        仍然拿不到就重试一次，最后才报错，并把被重定向到的地址与页面大小带出去。
+        """
+        last: Any = None
+        for attempt in (1, 2):
+            # 关键：丢掉旧的 CASTGC，CAS 才会重新返回登录页而不是直接跳走。
+            self.session.cookies.clear()
+            resp = self._request("GET", login_url)
+            last = resp
+            if resp.status_code == 200:
+                inputs = _parse_inputs(resp.text)
+                by_id: dict[str, str] = {}
+                for item in inputs:
+                    if item["id"] and item["id"] not in by_id:
+                        by_id[item["id"]] = item["value"]
+                if by_id.get("pwdEncryptSalt") and by_id.get("execution"):
+                    return inputs, by_id
+            if attempt == 1:
+                time.sleep(RETRY_BACKOFF)
+
+        if last is not None and last.status_code != 200:
+            raise LoginError(f"打开中央认证登录页失败：HTTP {last.status_code}")
+        redirected = f"；本次被重定向到 {last.url}" if getattr(last, "history", None) else ""
+        size = len(last.text) if last is not None else 0
+        raise PageChangedError(
+            "中央认证登录页结构已变化，未找到 pwdEncryptSalt / execution 字段"
+            f"{redirected}（返回 {size} 字节）"
+        )
 
     @staticmethod
     def _encrypt_password(password: str, salt: str) -> str:
@@ -298,11 +345,13 @@ class XgxtClient:
         resp = self._request("GET", url)
         if resp.status_code != 200:
             raise DgutError(f"GET {path} 失败：HTTP {resp.status_code}")
-        # 会话过期时系统会返回一段 JS 跳转，这里做一个兜底重建
-        if "authserver/login" in resp.text and len(resp.text) < 600:
+        # 会话过期时系统会跳回中央认证，这里做一个兜底重建
+        if _looks_like_login_page(resp):
             self.logged_in = False
             self.login()
             resp = self._request("GET", url)
+            if resp.status_code != 200:
+                raise DgutError(f"GET {path} 失败：HTTP {resp.status_code}")
         return resp.text
 
     def _post(self, path: str, data: list[tuple[str, str]]) -> str:

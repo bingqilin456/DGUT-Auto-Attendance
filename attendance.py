@@ -43,11 +43,14 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # 默认每轮对账间隔（秒）。到达考勤时间点时会提前唤醒，不受此值影响。
 DEFAULT_INTERVAL = 600
-# GitHub Actions 单个 job 上限 6 小时，留一点余量。
+# 「软上限」：跑到这个时长，就该考虑收摊了。
 DEFAULT_MAX_HOURS = 5.5
-# 到达运行时间上限时，若当前时段的结束就在眼前，就多撑这几分钟把签退做完，
-# 免得带着「在岗」状态退出、让工时一直涨到下一次运行才发现。
-MAX_EXTENSION_MIN = 20
+# 「硬上限」：本次运行绝对不能超过的时长，必须小于 workflow 里的
+# timeout-minutes（main.yml 里是 358 分钟 ≈ 5.97 小时）。到达软上限后，
+# 只有当「当前时段的结束」还落在硬上限之内时，才会继续撑下去把它签退掉。
+DEFAULT_HARD_MAX_HOURS = 5.8
+# 签退动作本身要留的余量（秒），别卡在硬上限上被 GitHub 掐断。
+SIGN_OUT_MARGIN_SEC = 120
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +198,34 @@ def boundaries(plan: list[list[datetime]]) -> list[datetime]:
     return sorted(points)
 
 
+def active_window(now: datetime, plan: list[list[datetime]]) -> tuple[datetime, datetime] | None:
+    """``now`` 所处的考勤时段；不在任何时段内时返回 ``None``。"""
+    for start, end in plan:
+        if start <= now < end:
+            return start, end
+    return None
+
+
+def extension_seconds(
+    now: datetime,
+    plan: list[list[datetime]],
+    monotonic_now: float,
+    hard_deadline: float,
+) -> float | None:
+    """到达运行时间上限时，判断还值不值得撑到当前时段结束。
+
+    返回还需要继续运行的秒数；返回 ``None`` 表示撑不住（当前不在任何时段内，
+    或者时段的结束时刻已经超出 job 的硬上限），此时应该如实退出，让下一次运行接手。
+    """
+    window = active_window(now, plan)
+    if window is None:
+        return None
+    need = (window[1] - now).total_seconds() + SIGN_OUT_MARGIN_SEC
+    if monotonic_now + need > hard_deadline:
+        return None
+    return need
+
+
 def post_server(key: str, content: str) -> None:
     """通过 Server酱 推送一条消息（可选功能，失败不影响打卡）。"""
     try:
@@ -234,13 +265,18 @@ def reconcile_once(
     *,
     key: str | None = None,
     dry_run: bool = False,
+    clock=None,
 ) -> str | None:
     """做一轮对账。
+
+    Args:
+        clock: 取当前北京时间的函数，默认 :func:`beijing_naive`（测试时可注入假时钟）。
 
     Returns:
         本轮实际发生的变化描述（``'签到'`` / ``'签退'``），没变化则返回 ``None``。
     """
-    now = beijing_naive()
+    clock = clock or beijing_naive
+    now = clock()
     want = desired_signed_in(now, plan)
 
     state = client.get_attendance_state(work_assignment_id)
@@ -257,6 +293,19 @@ def reconcile_once(
         )
         return None
 
+    # ---- 动手之前，必须用「刚刚」的时间再判一次（TOCTOU 防护）----
+    # 上面那次读状态要走两个请求，校园网慢的时候要十几秒甚至几十秒。
+    # 2026-10-08 12:00 就是这么出错的：11:59:33 采样判定「该在岗」，读状态期间
+    # 另一个进程正好在 12:00:05 签退，本进程却拿着 11:59 的旧结论在 12:00:14
+    # 又签到，凭空多出一条 12:00:13~12:10:12 的记录，整天的考勤因此变成「需确认」。
+    act_time = clock()
+    if desired_signed_in(act_time, plan) != want:
+        log(
+            f"读状态期间跨过了考勤时段边界（判定时 {now:%H:%M:%S}，现在 {act_time:%H:%M:%S}），"
+            "放弃本轮动作，下一轮重新判断"
+        )
+        return None
+
     action = "签到" if want else "签退"
     if dry_run:
         log(f"[dry-run] 应在 {state.work_assignment_name} {action}（期望在岗={want}，实际={actual}）")
@@ -270,7 +319,7 @@ def reconcile_once(
 
     log(f"{action}完成，当前状态：{new_state.describe()}")
     if key:
-        post_server(key, f"{action}成功 {now:%Y-%m-%d %H:%M:%S}")
+        post_server(key, f"{action}成功 {act_time:%Y-%m-%d %H:%M:%S}")
     return action
 
 
@@ -312,6 +361,31 @@ def _normalize_key(raw: str | None) -> str | None:
     return value or None
 
 
+def resolve_today_plan(
+    schedule_file: str | Path,
+    special_file: str | Path,
+    config: dict,
+    now: datetime | None = None,
+):
+    """算出「今天」的考勤时段，返回 ``(plan, 跳过原因)``。"""
+    special = get_special_schedule(special_file, now)
+    skip_reason = should_skip_today(config, special)
+    if skip_reason:
+        return [], skip_reason
+    # special 为 None 表示「今天没特殊安排」，才轮到星期表；
+    # 空列表 [] 是明确表态「今天不考勤」，不能再退回星期表去打卡。
+    return (special if special is not None else get_schedule(schedule_file, 1, now)), None
+
+
+def log_plan(plan: list[list[datetime]]) -> None:
+    """把今天的时段打印出来（0 个时段时说明只做收尾）。"""
+    if plan:
+        for start, end in plan:
+            log(f"  今日考勤时段：{start:%H:%M} - {end:%H:%M}")
+    else:
+        log("  今天没有考勤安排，仅做一次收尾检查（不会主动签到）")
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -327,7 +401,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--schedule", default=str(BASE_DIR / "schedule.json"), help="星期考勤表")
     parser.add_argument("--special", default=str(BASE_DIR / "special.json"), help="特殊日期考勤表")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="对账间隔（秒）")
-    parser.add_argument("--max-hours", type=float, default=DEFAULT_MAX_HOURS, help="单次运行最长时间（小时）")
+    parser.add_argument("--max-hours", type=float, default=DEFAULT_MAX_HOURS,
+                        help="单次运行的软上限（小时），到点后准备收摊")
+    parser.add_argument("--hard-max-hours", type=float, default=DEFAULT_HARD_MAX_HOURS,
+                        help="单次运行的硬上限（小时），必须小于 workflow 的 timeout-minutes")
     parser.add_argument("--once", action="store_true", help="只做一轮对账就退出")
     parser.add_argument("--dry-run", action="store_true", help="只报告将要做什么，不真正打卡")
     args = parser.parse_args(argv)
@@ -336,22 +413,15 @@ def main(argv: list[str] | None = None) -> int:
     config = get_config(args.config)
     waid = _resolve_work_assignment_id(args.work_assignment_id, config)
 
-    special = get_special_schedule(args.special)
-    skip_reason = should_skip_today(config, special)
+    plan, skip_reason = resolve_today_plan(args.schedule, args.special, config)
     if skip_reason:
         log(f"[程序结束] {skip_reason}")
         return 0
 
-    # special 为 None 表示「今天没特殊安排」，才轮到星期表；
-    # 空列表 [] 是明确表态「今天不考勤」，不能再退回星期表去打卡。
-    plan = special if special is not None else get_schedule(args.schedule, 1)
     log(f"[程序启动] 北京时间 {beijing_naive():%Y-%m-%d %H:%M:%S}")
-    if plan:
-        for start, end in plan:
-            log(f"  今日考勤时段：{start:%H:%M} - {end:%H:%M}")
-    else:
-        log("  今天没有考勤安排，仅做一次收尾检查（不会主动签到）")
+    log_plan(plan)
     log(f"  考勤职位：{waid or '（取列表中第一个）'}{'  [dry-run]' if args.dry_run else ''}")
+    log(f"  运行时长：软上限 {args.max_hours} 小时，硬上限 {args.hard_max_hours} 小时")
 
     client = XgxtClient(args.username, args.password)
     login_error: Exception | None = None
@@ -371,9 +441,25 @@ def main(argv: list[str] | None = None) -> int:
     log("[登录成功]")
 
     deadline = time.monotonic() + args.max_hours * 3600
+    hard_deadline = time.monotonic() + args.hard_max_hours * 3600
+    plan_date = beijing_naive().date()
     points = boundaries(plan)
 
     while True:
+        # 跨过午夜之后必须重新读「今天」的排班：桌面版常常整夜开着，云端也会遇到
+        # 运行跨越 00:00 的情况。否则第二天整个上午都会拿着昨天的时段表空转，
+        # 该签到的时候一声不响。
+        today = beijing_naive().date()
+        if today != plan_date:
+            plan_date = today
+            plan, skip_reason = resolve_today_plan(args.schedule, args.special, config)
+            points = boundaries(plan)
+            log(f"[跨天] 进入 {today:%Y-%m-%d}，重新读取排班")
+            if skip_reason:
+                log(f"[程序结束] {skip_reason}")
+                break
+            log_plan(plan)
+
         now = beijing_naive()
         try:
             reconcile_once(client, waid, plan, key=key, dry_run=args.dry_run)
@@ -402,19 +488,26 @@ def main(argv: list[str] | None = None) -> int:
             break
 
         if time.monotonic() >= deadline:
-            # 到点了。如果当前时段马上就要结束，就多撑一小会儿把签退做完；
-            # 否则如实记一笔「还开着」，交给下一次运行收尾。
-            current_end = next((e for s, e in plan if s <= now < e), None)
-            remaining = (current_end - now).total_seconds() if current_end else None
-            if remaining is not None and 0 < remaining <= MAX_EXTENSION_MIN * 60:
-                log(f"[延长运行] 当前时段 {current_end:%H:%M} 即将结束，"
-                    f"多等 {remaining / 60:.0f} 分钟把签退做完")
-                deadline = time.monotonic() + remaining + 60
-                time.sleep(min(remaining + 60, 300))
+            # 到点了。只有当「当前时段的结束 + 签退余量」还落在硬上限之内，
+            # 才继续撑下去把签退做完；否则如实退出，交给下一次运行收尾。
+            # 2026-10-08 的 17:00 就是这么丢的：两次运行都在时段中途退出，
+            # 17:00 时没有任何进程活着，那次签到一直挂到 21:00 才被收尾，
+            # 于是 14:30-17:00 和 18:00-21:00 被合并成一条 6.5 小时的记录。
+            need = extension_seconds(now, plan, time.monotonic(), hard_deadline)
+            if need is not None:
+                window = active_window(now, plan)
+                log(f"[延长运行] 当前时段 {window[1]:%H:%M} 才结束，"
+                    f"再跑 {need / 60:.0f} 分钟把签退做完")
+                deadline = time.monotonic() + need
                 continue
-            log(f"[警告] 已到运行时间上限，但当前仍在考勤时段内（{now:%H:%M}）："
-                "本次运行不会在这里签退，留待下一次运行收尾")
-            log("[程序结束] 已达本次运行时间上限")
+            window = active_window(now, plan)
+            if window is not None:
+                log(f"[警告] 已到运行时间上限（{args.max_hours} 小时），但当前仍在考勤时段内"
+                    f"（{now:%H:%M}，要到 {window[1]:%H:%M} 才结束，"
+                    f"硬上限 {args.hard_max_hours} 小时内来不及收尾）："
+                    "本次运行按时收摊，这条在岗记录留给下一次运行收尾")
+            else:
+                log(f"[程序结束] 已达本次运行时间上限（{args.max_hours} 小时）")
             break
 
         sleep_for = min((upcoming[0] - now).total_seconds(), args.interval)
