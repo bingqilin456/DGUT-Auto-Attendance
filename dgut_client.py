@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from random import choices
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from Crypto.Cipher import AES
@@ -219,6 +219,7 @@ class XgxtClient:
         Args:
             service: CAS 回跳地址。必须是绝对 URL。
         """
+        self.logged_in = False
         login_url = f"{AUTH_URL}?service={requests.utils.quote(service, safe='')}"
         referer_headers = {"Referer": login_url, "Origin": "https://auth.dgut.edu.cn"}
 
@@ -246,8 +247,10 @@ class XgxtClient:
         resp = self._request("POST", login_url, data=data, headers=referer_headers)
         if resp.status_code == 401 or "密码错误" in resp.text or "用户名或密码" in resp.text:
             raise LoginError("账号或密码错误")
-        if not resp.history and "authserver/login" in resp.url:
-            raise LoginError("登录未跳转，账号或密码可能不正确")
+        if resp.status_code != 200:
+            raise LoginError(f"中央认证登录失败：HTTP {resp.status_code}")
+        if _looks_like_login_page(resp):
+            raise LoginError("登录后仍停留在认证页，学工系统会话未建立")
         self.logged_in = True
 
     def _fetch_login_form(self, login_url: str) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -311,7 +314,8 @@ class XgxtClient:
             self.login()
 
     # ------------------------------------------------------------ HTTP 层 --
-    def _request(self, method: str, url: str, *, headers=None, data=None):
+    def _request(self, method: str, url: str, *, headers=None, data=None,
+                 retries: int = REQUEST_RETRIES):
         """带重试的请求。
 
         网络层的异常（超时、连接被重置）统一转成 :class:`DgutError`，
@@ -319,23 +323,23 @@ class XgxtClient:
         漏出去、把整个进程搞崩。
         """
         last: Exception | None = None
-        for attempt in range(1, REQUEST_RETRIES + 1):
+        for attempt in range(1, retries + 1):
             try:
                 resp = self.session.request(
                     method, url, timeout=self.timeout, headers=headers, data=data)
             except requests.RequestException as exc:
                 last = exc
-                if attempt < REQUEST_RETRIES:
+                if attempt < retries:
                     time.sleep(RETRY_BACKOFF * attempt)
                     continue
             else:
                 # 5xx 多半是服务端打了个嗝，值得再试；4xx 直接返回给上层判断
-                if resp.status_code < 500 or attempt == REQUEST_RETRIES:
+                if resp.status_code < 500 or attempt == retries:
                     return resp
                 last = DgutError(f"HTTP {resp.status_code}")
                 time.sleep(RETRY_BACKOFF * attempt)
         raise DgutError(
-            f"网络请求失败（已重试 {REQUEST_RETRIES} 次）："
+            f"网络请求失败（已尝试 {retries} 次）："
             f"{type(last).__name__}: {last}"
         ) from last
 
@@ -352,15 +356,26 @@ class XgxtClient:
             resp = self._request("GET", url)
             if resp.status_code != 200:
                 raise DgutError(f"GET {path} 失败：HTTP {resp.status_code}")
+            if _looks_like_login_page(resp):
+                self.logged_in = False
+                raise LoginError("重新登录后仍返回认证页，暂时无法读取考勤状态")
         return resp.text
 
     def _post(self, path: str, data: list[tuple[str, str]]) -> str:
         self._ensure_login()
         url = path if path.startswith("http") else BASE_URL + path
+        is_action = any(name == "action_name" and value in ("beginWork", "endWork")
+                        for name, value in data)
+        # 动作超时可能意味着服务端已完成写入。交给下一轮先读状态，再决定是否补发。
         resp = self._request(
             "POST", url, data=data,
             headers={"Referer": url, "Origin": BASE_URL},
+            retries=1 if is_action else REQUEST_RETRIES,
         )
+        if _looks_like_login_page(resp):
+            self.logged_in = False
+            # 不在这里重发旧表单：重新认证后 session_token 和记录可能已改变。
+            raise LoginError("提交考勤表单时会话已过期，需要重新读取状态和表单")
         if resp.status_code != 200:
             raise DgutError(f"POST {path} 失败：HTTP {resp.status_code}")
         return resp.text
@@ -434,48 +449,85 @@ class XgxtClient:
     @staticmethod
     def _parse_state(html: str, waid: str, waname: str) -> AttendanceState:
         state = AttendanceState(work_assignment_id=waid, work_assignment_name=waname)
+        recognized = False
 
-        for onclick, text in _enabled_buttons(html):
-            if "beginWork" in onclick and "签到" in text:
-                state.can_sign_in = True
-            m = re.search(r"doEndWork\(\s*'?(\d+)'?\s*,\s*'?(\d+)'?\s*\)", onclick)
-            if m:
-                state.can_sign_out = True
-                state.open_record_id = m.group(1)
-                state.open_end_work_assignment_id = m.group(2)
-            elif "endWork" in onclick and "签退" in text:
-                state.can_sign_out = True
+        def read_buttons(fragment: str) -> bool:
+            found = False
+            for onclick, text in _enabled_buttons(fragment):
+                if "beginWork" in onclick and "签到" in text:
+                    state.can_sign_in = True
+                    found = True
+                if "签退" not in text:
+                    continue
+                m = re.search(r"doEndWork\(\s*'?(\d+)'?\s*,\s*'?(\d+)'?\s*\)", onclick)
+                if m:
+                    state.can_sign_out = True
+                    state.open_record_id = m.group(1)
+                    state.open_end_work_assignment_id = m.group(2)
+                    found = True
+                elif "endWork" in onclick:
+                    state.can_sign_out = True
+                    found = True
+            return found
 
-        # 行级信息：用于判断“在岗中”以及留下可读的日志
-        tbody = re.search(r"<tbody[^>]*>(.*?)</tbody>", html, re.S | re.I)
-        if tbody:
-            for row in re.finditer(r"<tr[^>]*>(.*?)</tr>", tbody.group(1), re.S | re.I):
-                cells = [
-                    re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", c)).strip()
-                    for c in re.findall(r"<td[^>]*>(.*?)</td>", row.group(1), re.S | re.I)
-                ]
-                if not any(cells):
-                    continue
-                joined = " | ".join(cells)
-                if "暂未签到" in joined:
-                    continue
+        # 页面上的日期用于补全只显示 HH:MM:SS 的记录；显式记录日期优先。
+        visible_html = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", "", html, flags=re.S | re.I)
+        visible_text = re.sub(r"<[^>]+>", " ", visible_html)
+        page_date = re.search(r"\b\d{4}-\d{2}-\d{2}\b", visible_text)
+        day = page_date.group(0) if page_date else beijing_now().strftime("%Y-%m-%d")
+
+        row_pattern = r"<tr\b[^>]*>(.*?)</tr>"
+        for row in re.finditer(row_pattern, html, re.S | re.I):
+            row_html = row.group(1)
+            cells = [
+                re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", c)).strip()
+                for c in re.findall(r"<td\b[^>]*>(.*?)</td>", row_html, re.S | re.I)
+            ]
+            if not any(cells):
+                continue
+            joined = " | ".join(cells)
+            is_empty = "暂未签到" in joined or "未签到" in joined
+            is_closed = "已签退" in joined
+            has_status = is_empty or is_closed or "已签到" in joined
+            recognized = recognized or has_status
+            # 历史已签退行即使残留 onclick，也不能成为当前开放记录。
+            if is_closed:
                 state.rows.append({"cells": cells, "raw": joined})
-                if "已签退" not in joined and re.search(r"\d{4}-\d{2}-\d{2}", joined):
-                    state.signed_in = True
-                    m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", joined)
-                    if m:
-                        try:
-                            state.open_started_at = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                        except ValueError:
-                            pass
+                continue
+            has_buttons = read_buttons(row_html)
+            recognized = recognized or has_buttons
+            if is_empty:
+                continue
+            if not has_status and not has_buttons:
+                continue
+            state.rows.append({"cells": cells, "raw": joined})
+            row_open = "已签到" in joined or any(
+                "签退" in text and ("doEndWork" in onclick or "endWork" in onclick)
+                for onclick, text in _enabled_buttons(row_html)
+            )
+            if row_open:
+                state.signed_in = True
+                m = re.search(r"(?:(\d{4}-\d{2}-\d{2})\s+)?(\d{1,2}:\d{2}:\d{2})", cells[0])
+                if m:
+                    try:
+                        state.open_started_at = datetime.strptime(
+                            f"{m.group(1) or day} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        pass
 
-        # 更可靠的判据：存在可用的签退按钮 ⇒ 有一条未结束的在岗记录
+        # 兼容按钮位于表格外的页面布局，历史行的按钮已经单独处理。
+        outside_rows = re.sub(row_pattern, "", html, flags=re.S | re.I)
+        recognized = read_buttons(outside_rows) or recognized
+        if not _select_options(html, "workAssignmentId") or not recognized:
+            raise PageChangedError("未识别到考勤表单和状态，不能确认是否在岗")
+
         if state.can_sign_out:
             state.signed_in = True
         return state
 
     # ------------------------------------------------------------- 动作 --
-    def sign_in(self, work_assignment_id: str | int | None = None) -> AttendanceState:
+    def sign_in(self, work_assignment_id: str | int | None = None, *,
+                can_submit: Callable[[], bool] | None = None) -> AttendanceState:
         """签到。若已在岗则直接返回当前状态。"""
         state = self.get_attendance_state(work_assignment_id)
         if state.signed_in:
@@ -485,6 +537,8 @@ class XgxtClient:
                 f"{state.work_assignment_name} 当前没有可用的签到按钮，无法签到"
             )
         html = self._get(ATTENDANCE_PAGE)
+        if can_submit is not None and not can_submit():
+            return state
         self._post(ATTENDANCE_PAGE, self._payload(html, state.work_assignment_id, "beginWork"))
         after = self.get_attendance_state(state.work_assignment_id)
         if not after.signed_in:
@@ -493,16 +547,22 @@ class XgxtClient:
             )
         return after
 
-    def sign_out(self, work_assignment_id: str | int | None = None) -> AttendanceState:
+    def sign_out(self, work_assignment_id: str | int | None = None, *,
+                 can_submit: Callable[[], bool] | None = None,
+                 expected_open_record_id: str | None = None) -> AttendanceState:
         """签退。若当前不在岗则直接返回当前状态。"""
         state = self.get_attendance_state(work_assignment_id)
         if not state.signed_in:
             return state
+        if expected_open_record_id is not None and state.open_record_id != expected_open_record_id:
+            raise ActionFailedError("在岗记录已变化，放弃本次签退，下一轮重新读取状态")
         if not state.can_sign_out:
             raise ActionFailedError(
                 f"{state.work_assignment_name} 处于在岗状态，但页面上没有可用的签退按钮"
             )
         html = self._get(ATTENDANCE_PAGE)
+        if can_submit is not None and not can_submit():
+            return state
         self._post(
             ATTENDANCE_PAGE,
             self._payload(

@@ -43,6 +43,9 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # 默认每轮对账间隔（秒）。到达考勤时间点时会提前唤醒，不受此值影响。
 DEFAULT_INTERVAL = 600
+# 故障时尽快重新读状态，不让一次失败额外拖延十分钟。
+DEFAULT_RETRY_INTERVAL = 30
+DEFAULT_CLEANUP_SECONDS = 600
 # 「软上限」：跑到这个时长，就该考虑收摊了。
 DEFAULT_MAX_HOURS = 5.5
 # 「硬上限」：本次运行绝对不能超过的时长，必须小于 workflow 里的
@@ -198,9 +201,20 @@ def boundaries(plan: list[list[datetime]]) -> list[datetime]:
     return sorted(points)
 
 
+def continuous_windows(plan: list[list[datetime]]) -> list[list[datetime]]:
+    """合并相连或重叠的班次，其间不需要签退或交接。"""
+    merged: list[list[datetime]] = []
+    for start, end in sorted(plan):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
 def active_window(now: datetime, plan: list[list[datetime]]) -> tuple[datetime, datetime] | None:
     """``now`` 所处的考勤时段；不在任何时段内时返回 ``None``。"""
-    for start, end in plan:
+    for start, end in continuous_windows(plan):
         if start <= now < end:
             return start, end
     return None
@@ -250,12 +264,17 @@ def _may_sign_out(state, now: datetime, plan: list[list[datetime]]) -> bool:
     反而会破坏他的真实工时。所以只有下面两种情况才动手：
 
     1. 在岗记录是 **更早的日期** 开的 —— 一定是遗留，必须收尾；
-    2. 今天 **已经有考勤时段结束过** —— 说明是本程序签到后没能正常签退。
+    2. 记录的签到时间属于今天已经结束的考勤时段。
+
+    同时用于恢复时识别上一班次遗留记录；不能只比较「是否在岗」，否则上一班
+    漏签退的记录会被误认为是下一班的正常签到，两个班次被合并。
     """
     started = getattr(state, "open_started_at", None)
     if started is not None and started.date() < now.date():
         return True
-    return any(end <= now for _, end in plan)
+    if started is None:
+        return False
+    return any(start <= started < end <= now for start, end in continuous_windows(plan))
 
 
 def reconcile_once(
@@ -281,8 +300,9 @@ def reconcile_once(
 
     state = client.get_attendance_state(work_assignment_id)
     actual = state.signed_in
+    stale_record = actual and _may_sign_out(state, now, plan)
 
-    if want == actual:
+    if want == actual and not stale_record:
         log(f"对账完成：{state.work_assignment_name} 当前{state.describe()}，与计划一致，无需动作")
         return None
 
@@ -306,16 +326,35 @@ def reconcile_once(
         )
         return None
 
-    action = "签到" if want else "签退"
+    # 即使已经进入下一班，也先收尾旧记录。下一轮重新读状态后再签到，
+    # 不伪造原来漏掉的签退时间，也不把两次动作作为一次未经校验的提交。
+    signing_in = want and not stale_record
+    action = "签到" if signing_in else "签退"
     if dry_run:
         log(f"[dry-run] 应在 {state.work_assignment_name} {action}（期望在岗={want}，实际={actual}）")
         return None
 
     log(f"{state.work_assignment_name} 需要{action}（期望在岗={want}，实际在岗={actual}）")
-    if want:
-        new_state = client.sign_in(state.work_assignment_id)
+    if stale_record and want:
+        log(f"发现上一班次遗留记录（{state.open_started_at}），先签退，再重新对账当前班次")
+
+    def can_submit() -> bool:
+        submit_time = clock()
+        if signing_in:
+            return desired_signed_in(submit_time, plan) and submit_time.date() == now.date()
+        if stale_record:
+            return _may_sign_out(state, submit_time, plan)
+        return not desired_signed_in(submit_time, plan) and _may_sign_out(state, submit_time, plan)
+
+    if signing_in:
+        new_state = client.sign_in(state.work_assignment_id, can_submit=can_submit)
     else:
-        new_state = client.sign_out(state.work_assignment_id)
+        new_state = client.sign_out(state.work_assignment_id, can_submit=can_submit,
+                                    expected_open_record_id=state.open_record_id)
+
+    if new_state.signed_in != signing_in:
+        log(f"实际提交前考勤时段已变化，取消{action}，下一轮重新对账")
+        return None
 
     log(f"{action}完成，当前状态：{new_state.describe()}")
     if key:
@@ -401,6 +440,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--schedule", default=str(BASE_DIR / "schedule.json"), help="星期考勤表")
     parser.add_argument("--special", default=str(BASE_DIR / "special.json"), help="特殊日期考勤表")
     parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="对账间隔（秒）")
+    parser.add_argument("--retry-interval", type=int, default=DEFAULT_RETRY_INTERVAL,
+                        help="对账失败后的重试间隔（秒）")
+    parser.add_argument("--cleanup-seconds", type=int, default=DEFAULT_CLEANUP_SECONDS,
+                        help="结束班次后签退失败的重试窗口（秒）")
+    parser.add_argument("--finish-window", action="store_true",
+                        help="完成当前或下一班次并确认收尾后退出，让下一次运行接手")
     parser.add_argument("--max-hours", type=float, default=DEFAULT_MAX_HOURS,
                         help="单次运行的软上限（小时），到点后准备收摊")
     parser.add_argument("--hard-max-hours", type=float, default=DEFAULT_HARD_MAX_HOURS,
@@ -408,6 +453,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="只做一轮对账就退出")
     parser.add_argument("--dry-run", action="store_true", help="只报告将要做什么，不真正打卡")
     args = parser.parse_args(argv)
+    if min(args.interval, args.retry_interval, args.cleanup_seconds, args.max_hours, args.hard_max_hours) <= 0:
+        parser.error("对账/重试间隔、收尾时间和运行上限必须大于 0")
+    if args.max_hours > args.hard_max_hours:
+        parser.error("软上限不能大于硬上限")
 
     key = _normalize_key(args.key)
     config = get_config(args.config)
@@ -440,10 +489,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     log("[登录成功]")
 
-    deadline = time.monotonic() + args.max_hours * 3600
-    hard_deadline = time.monotonic() + args.hard_max_hours * 3600
-    plan_date = beijing_naive().date()
+    started = time.monotonic()
+    deadline = started + args.max_hours * 3600
+    hard_deadline = started + args.hard_max_hours * 3600
+    initial_now = beijing_naive()
+    plan_date = initial_now.date()
     points = boundaries(plan)
+    pending_ends = [end for _, end in continuous_windows(plan) if end > initial_now]
+    finish_at = (min(pending_ends) if args.finish_window and pending_ends
+                 else max(points, default=initial_now))
+    if args.finish_window and pending_ends:
+        log(f"  本次完成 {finish_at:%H:%M} 结束的班次后交接")
+    cleanup_deadline: float | None = None
+    last_error: Exception | None = None
 
     while True:
         # 跨过午夜之后必须重新读「今天」的排班：桌面版常常整夜开着，云端也会遇到
@@ -457,35 +515,60 @@ def main(argv: list[str] | None = None) -> int:
             log(f"[跨天] 进入 {today:%Y-%m-%d}，重新读取排班")
             if skip_reason:
                 log(f"[程序结束] {skip_reason}")
-                break
+                return 0
             log_plan(plan)
+            finish_at = max(points, default=beijing_naive())
+            cleanup_deadline = None
 
-        now = beijing_naive()
+        monotonic_now = time.monotonic()
+        if monotonic_now >= hard_deadline:
+            log("[程序结束] 到达硬上限" + ("，仍未确认对账成功" if last_error else ""))
+            return 1 if last_error else 0
+        if cleanup_deadline is not None and monotonic_now >= cleanup_deadline:
+            log("[程序结束] 收尾重试超时，未能确认签退；请检查学校考勤页面")
+            if key:
+                post_server(key, "签退未确认：收尾重试超时，请检查学校考勤页面")
+            return 1
+
+        # 仅当这一轮从结束时刻之后开始，且状态读取/动作验证成功，才允许退出。
+        # 若读状态期间跨过边界，下一轮必须用新时间再读一次，不能把旧结果当收尾。
+        round_time = beijing_naive()
+        if round_time >= finish_at and cleanup_deadline is None:
+            cleanup_deadline = min(time.monotonic() + args.cleanup_seconds, hard_deadline)
+        action = None
         try:
-            reconcile_once(client, waid, plan, key=key, dry_run=args.dry_run)
+            action = reconcile_once(client, waid, plan, key=key, dry_run=args.dry_run)
+            if round_time >= finish_at and not args.dry_run and action != "签退":
+                # 保留未知归属/手动记录也会返回 None，不能据此宣称已签退。
+                # 尊重保留策略，同时让云端明确报告未确认收尾，便于人工处理。
+                final_state = client.get_attendance_state(waid)
+                if final_state.signed_in:
+                    raise DgutError("收尾时仍在岗，记录未自动签退；请人工核对考勤记录")
+            last_error = None
         except Exception as exc:
             # 单轮失败不致命：下一轮对账会自然重试。
             # 这里必须捕获 Exception 而不只是 DgutError —— 一旦漏出去进程就会
             # 直接崩掉，而此时可能正处于「已签到」状态，会话就挂在那儿没人签退，
             # 工时一直涨到下一次运行才发现（2026-09-29 就因此多算了 6.79 小时）。
             log(f"[本轮对账失败] {type(exc).__name__}: {exc}")
+            last_error = exc
 
         if args.once:
-            break
+            return 1 if last_error else 0
 
         now = beijing_naive()
         upcoming = [p for p in points if p > now]
-        if not upcoming:
-            # 关键收尾：刚跨过最后一个签退时刻时，上面那轮对账用的 `now` 是在
-            # 发起 HTTP 之前取的，可能还停在「时段内」的旧值（例如 00:53:59.9
-            # 采样、00:54:01 才打印），于是被判成「无需动作」。这里用全新时间
-            # 再对账一次，确保不会带着「在岗」状态退出。
-            try:
-                reconcile_once(client, waid, plan, key=key, dry_run=args.dry_run)
-            except Exception as exc:
-                log(f"[收尾对账失败] {type(exc).__name__}: {exc}")
-            log("[程序结束] 今日考勤时段已全部结束")
-            break
+        if now >= finish_at:
+            if last_error is None and round_time >= finish_at:
+                log("[程序结束] 本次班次收尾检查完成" if args.finish_window
+                    else "[程序结束] 今日考勤时段已全部结束，收尾检查完成")
+                return 0
+            if cleanup_deadline is None:
+                cleanup_deadline = min(time.monotonic() + args.cleanup_seconds, hard_deadline)
+            # 收尾期间优先重试，不因软上限到期而吞掉签退错误。
+            delay = args.retry_interval if last_error else 0
+            time.sleep(max(0, min(delay, cleanup_deadline - time.monotonic())))
+            continue
 
         if time.monotonic() >= deadline:
             # 到点了。只有当「当前时段的结束 + 签退余量」还落在硬上限之内，
@@ -508,13 +591,16 @@ def main(argv: list[str] | None = None) -> int:
                     "本次运行按时收摊，这条在岗记录留给下一次运行收尾")
             else:
                 log(f"[程序结束] 已达本次运行时间上限（{args.max_hours} 小时）")
-            break
+            return 1 if last_error else 0
 
-        sleep_for = min((upcoming[0] - now).total_seconds(), args.interval)
-        sleep_for = max(5.0, min(sleep_for, deadline - time.monotonic()))
+        interval = args.retry_interval if last_error else args.interval
+        # 关闭上一班的遗留记录后，立即重新读状态，开始当前班次。
+        if action == "签退" and desired_signed_in(now, plan):
+            interval = 0
+        next_boundary = min(upcoming[0] if upcoming else finish_at, finish_at)
+        sleep_for = min(max(0, (next_boundary - now).total_seconds()), interval,
+                        max(0, deadline - time.monotonic()))
         time.sleep(sleep_for)
-
-    return 0
 
 
 if __name__ == "__main__":

@@ -2,39 +2,24 @@ name: 学生助理考勤
 
 on:
   schedule:
-    # 注意：GitHub Actions 的 cron 一律使用 UTC，北京时间要减 8 小时。
-    #
-    # 为什么每小时都排一次（而不是像以前那样只排 4 次）：
-    # 实测这个仓库的 schedule 事件被排队得很厉害（目标 07:30 的实际上
-    # 09:40~10:40 才跑，目标 12:00 的拖到 15:00 之后）。原来只有 4 次，
-    # 每次最长跑 5.5 小时，一被拖就跑不进任何一个考勤时段；没有进程活着的时候
-    # 在岗记录就没人收尾 —— 2026-10-08 的 17:00 因此彻底丢失，
-    # 14:30-17:00 与 18:00-21:00 被合并成一条 6.5 小时的记录。
-    #
-    # 现在改成「每小时一次 + 并发锁 + 新的接管旧」，见下面的 concurrency：
-    # 每个整点过 5 分都会有一个全新进程接手对账，任何时刻最多只会有一个在跑。
-    # 排在 :05 而不是 :00，是为了避开 12:00 / 17:00 / 18:00 / 21:00 这些
-    # 正好落在整点上的签退时刻，别让「接管」打断正在进行的签到/签退。
-    - cron: '5 * * * *'
+    # 此处未设置 timezone，cron 使用 UTC；北京时间要减 8 小时。
+    # 每 15 分钟提供一次启动机会，避开整点的调度高峰。
+    # schedule 仍可能延迟或丢弃，不能保证准点启动或始终有进程在线。
+    - cron: '7,22,37,52 * * * *'
   # 允许在 Actions 页面手动触发，方便测试
   workflow_dispatch:
 
 concurrency:
-  # 关键修复之一：同一时刻只允许一个考勤进程。
-  # 以前没有这个配置，几个 cron 会交叉重叠跑：2026-10-08 12:00 就有两个进程
-  # 在抢同一张考勤表 —— 一个在 12:00:05 签退，另一个拿着 11:59 的旧判定在
-  # 12:00:13 又签到，凭空多出一条 12:00:13~12:10:12 的记录，
-  # 整天的考勤于是变成「需确认」。
-  #
-  # cancel-in-progress: true 是「新的接管旧的」：新进程立刻开始对账（幂等，
-  # 状态一致就不动），被中断的那个本来也只是在睡觉等下一个时段边界，
-  # 不会因此丢掉任何动作。这样运行时间首尾相接，永远不会出现「没人活着」。
+  # 同一时刻只允许一个考勤进程；后续运行等待，不取消守着签退边界的进程。
+  # 默认仅保留一个 pending，新的定时运行会替换旧 pending，避免积压。
+  # --finish-window 在完成一段班次并确认签退后退出，让等待中的运行接手。
+  # 运行器失联时必须等 GitHub 判定失败或超时释放并发锁，无法在代码里保证恢复。
   group: dgut-attendance
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   attendance:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 单个 job 硬上限是 360 分钟。程序软上限 --max-hours 5.5（330 分钟），
     # 到点后最多再延长到硬上限 --hard-max-hours 5.8（348 分钟）把签退做完，
     # 所以这里留到 358。
@@ -47,6 +32,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install requirements
         run: pip install -r requirements.txt
@@ -57,10 +44,18 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Attendance
+        env:
+          DGUT_USERNAME: ${{ secrets.USERNAME }}
+          DGUT_PASSWORD: ${{ secrets.PASSWORD }}
+          SERVER_KEY: ${{ secrets.SERVER_KEY }}
+          PYTHONUNBUFFERED: '1'
         run: |
           python attendance.py \
-            -U "${{ secrets.USERNAME }}" \
-            -P "${{ secrets.PASSWORD }}" \
-            -K "${{ secrets.SERVER_KEY }}" \
+            -U "$DGUT_USERNAME" \
+            -P "$DGUT_PASSWORD" \
+            -K "$SERVER_KEY" \
+            --finish-window \
+            --retry-interval 30 \
+            --cleanup-seconds 600 \
             --max-hours 5.5 \
             --hard-max-hours 5.8

@@ -70,13 +70,17 @@ class FakeClient:
     def get_attendance_state(self, work_assignment_id=None) -> AttendanceState:
         return self._state()
 
-    def sign_in(self, work_assignment_id=None) -> AttendanceState:
+    def sign_in(self, work_assignment_id=None, *, can_submit=None) -> AttendanceState:
+        if can_submit is not None and not can_submit():
+            return self._state()
         self.actions.append("签到")
         self.signed_in = True
         self.started_at = att.beijing_naive()
         return self._state()
 
-    def sign_out(self, work_assignment_id=None) -> AttendanceState:
+    def sign_out(self, work_assignment_id=None, *, can_submit=None, expected_open_record_id=None) -> AttendanceState:
+        if can_submit is not None and not can_submit():
+            return self._state()
         self.actions.append("签退")
         self.signed_in = False
         self.started_at = None
@@ -128,6 +132,30 @@ class TestReconcile(LogCapture):
     def test_nothing_to_do_when_consistent(self):
         client = FakeClient(signed_in=True, started_at=at(9, 0))
         clock = FakeClock(at(9, 30), at(9, 30, 5))
+        self.assertIsNone(att.reconcile_once(client, "38605", PLAN, clock=clock))
+        self.assertEqual(client.actions, [])
+
+    def test_previous_shift_is_closed_before_starting_next_shift(self):
+        client = FakeClient(signed_in=True, started_at=at(14, 30))
+        clock = FakeClock(at(18, 37))
+        self.assertEqual(att.reconcile_once(client, "38605", PLAN, clock=clock), "签退")
+        self.assertEqual(client.actions, ["签退"])
+        self.assertEqual(att.reconcile_once(client, "38605", PLAN, clock=clock), "签到")
+        self.assertEqual(client.actions, ["签退", "签到"])
+
+    def test_manual_record_after_previous_shift_is_preserved(self):
+        client = FakeClient(signed_in=True, started_at=at(13))
+        self.assertIsNone(att.reconcile_once(client, "38605", PLAN, clock=FakeClock(at(13, 30))))
+        self.assertEqual(client.actions, [])
+
+    def test_stale_record_dry_run_does_not_act(self):
+        client = FakeClient(signed_in=True, started_at=at(14, 30))
+        self.assertIsNone(att.reconcile_once(client, "38605", PLAN, clock=FakeClock(at(18, 37)), dry_run=True))
+        self.assertEqual(client.actions, [])
+
+    def test_sign_in_checks_time_at_actual_submission(self):
+        client = FakeClient(signed_in=False)
+        clock = FakeClock(at(11, 59, 50), at(11, 59, 55), at(12, 0, 1))
         self.assertIsNone(att.reconcile_once(client, "38605", PLAN, clock=clock))
         self.assertEqual(client.actions, [])
 
@@ -238,14 +266,17 @@ class TestWorkflowConfig(unittest.TestCase):
 
     def test_has_concurrency_group(self):
         self.assertIn("group: dgut-attendance", self.text)
-        self.assertIn("cancel-in-progress: true", self.text)
+        self.assertIn("cancel-in-progress: false", self.text)
 
-    def test_runs_every_hour(self):
-        # :05 起跑，避开 12:00 / 17:00 / 18:00 / 21:00 这些整点边界
-        self.assertIn("cron: '5 * * * *'", self.text)
+    def test_runs_every_fifteen_minutes(self):
+        self.assertIn("cron: '7,22,37,52 * * * *'", self.text)
 
     def test_passes_hard_max_hours(self):
         self.assertIn("--hard-max-hours", self.text)
+
+    def test_hands_over_after_verified_window_end(self):
+        self.assertIn("--finish-window", self.text)
+        self.assertIn("--cleanup-seconds", self.text)
 
 
 if __name__ == "__main__":
