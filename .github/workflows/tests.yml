@@ -35,4 +35,4 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Check syntax
-        run: python -m compileall -q attendance.py dgut_client.py gui.py tests
+        run: python -m compileall -q attendance.py dgut_client.py gui.py workflow_relay.py tests

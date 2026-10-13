@@ -3,7 +3,8 @@ name: 学生助理考勤
 on:
   schedule:
     # 此处未设置 timezone，cron 使用 UTC；北京时间要减 8 小时。
-    # 每 15 分钟提供一次启动机会，避开整点的调度高峰。
+    # 每 15 分钟提供一次初次启动/故障恢复机会，避开整点的调度高峰。
+    # 日间正常接力由 workflow_relay.py 主动创建下一轮，不依赖下一次 cron。
     # schedule 仍可能延迟或丢弃，不能保证准点启动或始终有进程在线。
     - cron: '7,22,37,52 * * * *'
   # 允许在 Actions 页面手动触发，方便测试
@@ -20,6 +21,9 @@ concurrency:
 jobs:
   attendance:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write
     # 单个 job 硬上限是 360 分钟。程序软上限 --max-hours 5.5（330 分钟），
     # 到点后最多再延长到硬上限 --hard-max-hours 5.8（348 分钟）把签退做完，
     # 所以这里留到 358。
@@ -43,6 +47,15 @@ jobs:
         continue-on-error: true
         run: python -m unittest discover -s tests -v
 
+      - name: Queue next attendance run
+        id: relay
+        # GitHub API 失败也要继续本轮考勤；结束后单独把接力失败标红。
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PYTHONUNBUFFERED: '1'
+        run: python workflow_relay.py
+
       - name: Attendance
         env:
           DGUT_USERNAME: ${{ secrets.USERNAME }}
@@ -59,3 +72,9 @@ jobs:
             --cleanup-seconds 600 \
             --max-hours 5.5 \
             --hard-max-hours 5.8
+
+      - name: Report relay failure
+        if: ${{ !cancelled() && steps.relay.outcome == 'failure' }}
+        run: |
+          echo '接力任务未能创建；本轮考勤已执行，请检查 Queue next attendance run 日志。'
+          exit 1
