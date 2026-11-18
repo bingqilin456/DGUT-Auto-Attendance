@@ -33,7 +33,7 @@ from Crypto.Util.Padding import pad
 
 __all__ = [
     "DgutError", "LoginError", "CredentialsRejectedError", "CaptchaRequiredError",
-    "IpBlockedError", "PageChangedError", "ActionFailedError",
+    "IpBlockedError", "MultifactorRequiredError", "PageChangedError", "ActionFailedError",
     "WorkAssignment", "AttendanceState", "XgxtClient", "beijing_now",
 ]
 
@@ -92,6 +92,19 @@ class IpBlockedError(LoginError):
     2026-11-17 夜里，失败重试加接力把同一出口 IP 反复砸向认证中心，
     最终换来一张「IP冻结提示」页；此后连正确密码也登不上。
     识别出来的意义在于：这既不是密码错，也不会自愈，必须停止空转并等人处理。
+    """
+
+
+class MultifactorRequiredError(LoginError):
+    """密码已通过，但认证中心要求二次验证（短信/动态码）才能继续。
+
+    2026-11-18 定位到：登录成功后 CAS 302 到
+    ``reAuthCheck/reAuthLoginView.do?isMultifactor=true``。这是一张 27 KB 的
+    二次验证页，既不是失败页也不是普通登录页，所以旧代码会把它误报成
+    「登录后仍停留在认证页」，让人以为密码或者 Cookie 出了问题。
+
+    纯 HTTP 客户端无法跨越这一步：动态码只发到用户手机，脚本无从获取。
+    因此必须显式区分出来，直接告诉使用者「要去人工解除二次验证」。
     """
 
 
@@ -165,6 +178,17 @@ def _error_tip(html: str) -> str:
         if text:
             return text
     return ""
+
+
+def _looks_like_multifactor_page(resp: requests.Response) -> bool:
+    """判断这次响应是不是被二次验证（多因素）拦下了。
+
+    识别依据是 CAS 的 reAuth 视图本身，而不是页面文案 —— 文案会随主题变，
+    ``reAuthLoginView.do`` / ``isMultifactor=true`` 这两个是接口契约。
+    """
+    if "reAuthLoginView.do" in resp.url or "reAuthCheck" in resp.url:
+        return True
+    return "isMultifactor=true" in resp.text
 
 
 def _looks_like_login_page(resp: requests.Response) -> bool:
@@ -301,6 +325,14 @@ class XgxtClient:
             raise CredentialsRejectedError("账号或密码错误（HTTP 401）")
         if resp.status_code != 200:
             raise LoginError(f"中央认证登录失败：HTTP {resp.status_code}")
+        # 密码已经通过、被二次验证拦住时，CAS 会跳到 reAuth 视图。必须先认出它，
+        # 否则会被笼统报成「仍停留在认证页」，把排查引向密码/Cookie 的错方向。
+        if _looks_like_multifactor_page(resp):
+            raise MultifactorRequiredError(
+                "密码已通过，但认证中心要求二次验证（短信/动态码），脚本无法自动完成；"
+                f"请在浏览器手动登录一次并勾选「记住此设备」，或让管理员放宽该账号的多因素策略"
+                f"（最终地址 {resp.url}）"
+            )
         if _looks_like_login_page(resp):
             # 带上现场信息：区分「票据写回了登录页」「会话失效」和「被风控静默拦下」。
             raise LoginError(

@@ -37,6 +37,7 @@ from dgut_client import (
     CredentialsRejectedError,
     DgutError,
     IpBlockedError,
+    MultifactorRequiredError,
     XgxtClient,
     beijing_now,
 )
@@ -481,10 +482,12 @@ def main(argv: list[str] | None = None) -> int:
 
     client = XgxtClient(args.username, args.password)
     login_error: Exception | None = None
-    # 这三类错误重试只会得到同样结果：密码不被接受、必须人工过验证码、IP 被冻结。
+    # 这几类错误重试只会得到同样结果：密码不被接受、必须人工过验证码、
+    # IP 被冻结、需要手机完成二次验证。
     # 2026-11-17 就是在这里空转了一整夜（失败 → 接力又排下一轮 → 再失败），
     # 最后把出口 IP 也一起玩冻结了。
-    permanent = (CredentialsRejectedError, CaptchaRequiredError, IpBlockedError)
+    permanent = (CredentialsRejectedError, CaptchaRequiredError,
+                 IpBlockedError, MultifactorRequiredError)
     for attempt in range(1, 4):
         try:
             client.login()

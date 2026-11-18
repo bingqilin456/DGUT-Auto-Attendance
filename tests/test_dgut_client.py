@@ -149,6 +149,19 @@ class TestAuthentication(OfflineClientTest):
         self.assertTrue(issubclass(dgut.CredentialsRejectedError, dgut.LoginError))
         self.assertTrue(issubclass(dgut.CaptchaRequiredError, dgut.LoginError))
         self.assertTrue(issubclass(dgut.IpBlockedError, dgut.LoginError))
+        self.assertTrue(issubclass(dgut.MultifactorRequiredError, dgut.LoginError))
+
+    def test_multifactor_challenge_is_not_reported_as_a_stuck_login_page(self):
+        """2026-11-18 线上形态：密码过了，但被 reAuth 二次验证拦住。"""
+        self.client.logged_in = False
+        mfa_url = (dgut.AUTH_URL.replace("/login", "")
+                   + "/reAuthCheck/reAuthLoginView.do?isMultifactor=true"
+                     "&service=https%3A%2F%2Fstu.dgut.edu.cn%2F")
+        self.replies(response(AUTH_FORM, url=dgut.AUTH_URL),
+                     response("<html>动态码</html>" * 300, url=mfa_url))
+        with self.assertRaises(dgut.MultifactorRequiredError):
+            self.client.login()
+        self.assertFalse(self.client.logged_in)
 
     def test_frozen_ip_is_not_misreported_as_a_changed_login_page(self):
         """冻结页同样没有 pwdEncryptSalt，必须先认出「IP冻结」再报错。"""
