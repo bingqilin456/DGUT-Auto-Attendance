@@ -241,8 +241,10 @@ class XgxtClient:
     def __init__(self, username: str, password: str, timeout: int = 30) -> None:
         if not username or not password:
             raise ValueError("用户名和密码不能为空")
-        self.username = username
-        self._password = password
+        # Secrets 里粘错时会带上首尾空格/换行（尤其从密码管理器复制）。这些字符
+        # 会让服务端判为密码错误，而日志里又看不出差别，所以统一去掉首尾空白。
+        self.username = username.strip()
+        self._password = password.strip()
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
@@ -289,7 +291,12 @@ class XgxtClient:
             if "验证码" in tip or "滑块" in tip:
                 raise CaptchaRequiredError(f"认证中心要求验证码，脚本无法自动完成：{tip}")
             if "密码" in tip or "账号" in tip or "用户名" in tip or "锁定" in tip:
-                raise CredentialsRejectedError(f"账号或密码错误：{tip}")
+                # 带上账号和密码长度：能立刻区分「Secrets 没更新」和「密码值被污染」，
+                # 又不会把密码本身写进日志。
+                raise CredentialsRejectedError(
+                    f"账号或密码错误：{tip}（服务端收到账号 {self.username!r}、"
+                    f"密码长度 {len(self._password)}）"
+                )
         if resp.status_code == 401:
             raise CredentialsRejectedError("账号或密码错误（HTTP 401）")
         if resp.status_code != 200:
