@@ -106,6 +106,60 @@ class TestAuthentication(OfflineClientTest):
             self.client.login()
         self.assertFalse(self.client.logged_in)
 
+    def test_rejected_password_is_reported_as_credentials_error(self):
+        """2026-11 线上主题的提示语是「该账号非常用账号或用户名密码有误」。"""
+        self.client.logged_in = False
+        self.replies(response(AUTH_FORM, url=dgut.AUTH_URL),
+                     response('<span id="showErrorTip" class="form-error">'
+                              '<span>该账号非常用账号或用户名密码有误</span></span>',
+                              status=401, url=dgut.AUTH_URL))
+        with self.assertRaises(dgut.CredentialsRejectedError):
+            self.client.login()
+
+    def test_legacy_password_error_wording_is_also_a_credentials_error(self):
+        self.client.logged_in = False
+        self.replies(response(AUTH_FORM, url=dgut.AUTH_URL),
+                     response('<span id="showErrorTip">密码错误，请重试</span>',
+                              status=401, url=dgut.AUTH_URL))
+        with self.assertRaises(dgut.CredentialsRejectedError):
+            self.client.login()
+
+    def test_captcha_challenge_is_not_reported_as_wrong_password(self):
+        self.client.logged_in = False
+        self.replies(response(AUTH_FORM, url=dgut.AUTH_URL),
+                     response('<span id="showErrorTip" class="form-error">'
+                              '<span>请输入验证码</span></span>',
+                              status=401, url=dgut.AUTH_URL))
+        with self.assertRaises(dgut.CaptchaRequiredError):
+            self.client.login()
+
+    def test_captcha_image_alt_text_does_not_mimic_a_captcha_error(self):
+        """``alt="验证码错误"`` 每张登录页都有，不能因此把密码错误误判为风控。"""
+        page = ('<img id="captchaImg" alt="验证码错误">'
+                '<span id="showErrorTip" class="form-error">'
+                '<span>该账号非常用账号或用户名密码有误</span></span>')
+        self.client.logged_in = False
+        self.replies(response(AUTH_FORM, url=dgut.AUTH_URL),
+                     response(page, status=401, url=dgut.AUTH_URL))
+        with self.assertRaises(dgut.CredentialsRejectedError):
+            self.client.login()
+
+    def test_credentials_errors_are_login_errors(self):
+        # 调用方原本按 LoginError 捕获，新增子类不能破坏这个契约。
+        self.assertTrue(issubclass(dgut.CredentialsRejectedError, dgut.LoginError))
+        self.assertTrue(issubclass(dgut.CaptchaRequiredError, dgut.LoginError))
+        self.assertTrue(issubclass(dgut.IpBlockedError, dgut.LoginError))
+
+    def test_frozen_ip_is_not_misreported_as_a_changed_login_page(self):
+        """冻结页同样没有 pwdEncryptSalt，必须先认出「IP冻结」再报错。"""
+        frozen = ('<title>IP冻结提示</title><div class="ip-freeze-message">'
+                  '抱歉，您的IP（10.0.0.1）已被冻结</div>')
+        self.client.logged_in = False
+        self.replies(response(frozen, url=dgut.AUTH_URL),
+                     response(frozen, url=dgut.AUTH_URL))
+        with self.assertRaises(dgut.IpBlockedError):
+            self.client.login()
+
 
 class TestAttendanceParsing(OfflineClientTest):
     def parse(self, html):

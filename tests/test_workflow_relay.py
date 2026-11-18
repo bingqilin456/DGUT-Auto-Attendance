@@ -25,6 +25,9 @@ class TestRelay(unittest.TestCase):
     def setUp(self):
         self.post = self.enterContext(patch.object(relay.requests, "post"))
         self.post.side_effect = AssertionError("测试禁止访问 GitHub")
+        self.get = self.enterContext(patch.object(relay.requests, "get"))
+        # 默认「历史健康」，让这些用例专注接力本身；熔断另有专门用例。
+        self.get.return_value = Mock(status_code=200, json=lambda: {"workflow_runs": []})
         self.sleep = self.enterContext(patch.object(relay.time, "sleep"))
         self.enterContext(patch.object(relay, "log"))
         self.enterContext(patch.object(relay, "get_config", return_value={"holiday_attendance": True}))
@@ -99,6 +102,52 @@ class TestRelay(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "503"):
             relay.enqueue_next_run(environ=ENV, now=at(12))
         self.assertEqual(self.post.call_count, 3)
+
+
+class TestRelayCircuitBreaker(unittest.TestCase):
+    """连续失败必须停止接力，否则一次凭证错误会通宵空转。"""
+
+    def setUp(self):
+        self.post = self.enterContext(patch.object(relay.requests, "post"))
+        self.get = self.enterContext(patch.object(relay.requests, "get"))
+        self.enterContext(patch.object(relay.time, "sleep"))
+        self.enterContext(patch.object(relay, "log"))
+        self.enterContext(patch.object(relay, "get_config", return_value={"holiday_attendance": True}))
+        self.enterContext(patch.object(relay, "resolve_today_plan", return_value=(PLAN, None)))
+        self.post.return_value = Mock(status_code=204)
+        self.post.side_effect = None
+
+    def history(self, *conclusions):
+        runs = [{"status": "completed", "conclusion": c} for c in reversed(conclusions)]
+        self.get.return_value = Mock(status_code=200, json=lambda: {"workflow_runs": runs})
+
+    def test_consecutive_failures_stop_queuing_the_next_run(self):
+        self.history("failure", "failure", "failure")
+        self.assertFalse(relay.enqueue_next_run(environ=ENV, now=at(12)))
+        self.post.assert_not_called()
+
+    def test_a_single_failure_does_not_stop_the_relay(self):
+        self.history("failure", "success", "success")
+        self.assertTrue(relay.enqueue_next_run(environ=ENV, now=at(12)))
+        self.post.assert_called_once()
+
+    def test_in_progress_current_run_is_ignored(self):
+        runs = [{"status": "in_progress", "conclusion": None},
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "success"},
+                {"status": "completed", "conclusion": "failure"}]
+        self.get.return_value = Mock(status_code=200, json=lambda: {"workflow_runs": runs})
+        self.assertTrue(relay.enqueue_next_run(environ=ENV, now=at(12)))
+
+    def test_api_error_does_not_silently_stop_attendance(self):
+        self.get.return_value = Mock(status_code=403, json=lambda: {})
+        self.assertTrue(relay.enqueue_next_run(environ=ENV, now=at(12)))
+        self.post.assert_called_once()
+
+    def test_network_error_does_not_silently_stop_attendance(self):
+        self.get.side_effect = requests.ReadTimeout("timeout")
+        self.assertTrue(relay.enqueue_next_run(environ=ENV, now=at(12)))
+        self.post.assert_called_once()
 
 
 class TestWorkflowRelayConfig(unittest.TestCase):

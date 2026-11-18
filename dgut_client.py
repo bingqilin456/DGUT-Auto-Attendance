@@ -32,7 +32,8 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 __all__ = [
-    "DgutError", "LoginError", "PageChangedError", "ActionFailedError",
+    "DgutError", "LoginError", "CredentialsRejectedError", "CaptchaRequiredError",
+    "IpBlockedError", "PageChangedError", "ActionFailedError",
     "WorkAssignment", "AttendanceState", "XgxtClient", "beijing_now",
 ]
 
@@ -71,6 +72,27 @@ class DgutError(Exception):
 
 class LoginError(DgutError):
     """中央认证失败。"""
+
+
+class CredentialsRejectedError(LoginError):
+    """服务端明确拒绝这组账号密码 —— 重试没有意义，应当直接暴露给用户。
+
+    2026-11-17 的连续 600 次失败就是这么来的：密码被拒后程序照常重试，
+    而接力逻辑又在失败时继续排下一轮，于是整夜每 90 秒烧掉一次运行。
+    """
+
+
+class CaptchaRequiredError(LoginError):
+    """该账号已被认证中心要求输入验证码/滑块 —— 自动化无法完成，必须人工处理。"""
+
+
+class IpBlockedError(LoginError):
+    """出口 IP 被认证中心冻结（「多次无效登录尝试或其他异常活动」）。
+
+    2026-11-17 夜里，失败重试加接力把同一出口 IP 反复砸向认证中心，
+    最终换来一张「IP冻结提示」页；此后连正确密码也登不上。
+    识别出来的意义在于：这既不是密码错，也不会自愈，必须停止空转并等人处理。
+    """
 
 
 class PageChangedError(DgutError):
@@ -129,6 +151,20 @@ def _enabled_buttons(html: str) -> list[tuple[str, str]]:
         text = re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", m.group(2)))
         out.append((om.group(1), text))
     return out
+
+
+def _error_tip(html: str) -> str:
+    """取出认证页 ``#showErrorTip`` 里真正显示的报错文案。
+
+    不能直接在整页里搜关键词：``验证码错误`` 是 ``<img id="captchaImg" alt=...>``
+    的替代文本，**每一张**登录页都有，靠它判断会把普通的密码错误误判成验证码风控。
+    """
+    for m in re.finditer(r'id="showErrorTip"[^>]*>(.*?)</span>', html, re.S | re.I):
+        text = re.sub(r"<[^>]+>", " ", m.group(1))
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            return text
+    return ""
 
 
 def _looks_like_login_page(resp: requests.Response) -> bool:
@@ -245,8 +281,17 @@ class XgxtClient:
         }
 
         resp = self._request("POST", login_url, data=data, headers=referer_headers)
-        if resp.status_code == 401 or "密码错误" in resp.text or "用户名或密码" in resp.text:
-            raise LoginError("账号或密码错误")
+        # 认证中心把「密码错」和「风控要验证码」回显在同一张页面上，只能靠提示文案区分。
+        # 注意各家金智主题的措辞并不统一：本校 2026-11 用的是
+        # 「该账号非常用账号或用户名密码有误」，旧主题才是「密码错误」。
+        tip = _error_tip(resp.text)
+        if tip:
+            if "验证码" in tip or "滑块" in tip:
+                raise CaptchaRequiredError(f"认证中心要求验证码，脚本无法自动完成：{tip}")
+            if "密码" in tip or "账号" in tip or "用户名" in tip or "锁定" in tip:
+                raise CredentialsRejectedError(f"账号或密码错误：{tip}")
+        if resp.status_code == 401:
+            raise CredentialsRejectedError("账号或密码错误（HTTP 401）")
         if resp.status_code != 200:
             raise LoginError(f"中央认证登录失败：HTTP {resp.status_code}")
         if _looks_like_login_page(resp):
@@ -274,6 +319,14 @@ class XgxtClient:
             self.session.cookies.clear()
             resp = self._request("GET", login_url)
             last = resp
+            # IP 被冻结时认证中心给的是「IP冻结提示」页，里面没有登录表单。
+            # 必须先认出来：否则会被误报成「登录页结构已变化」，让人去查错方向，
+            # 而且下一次运行还会继续砸这个 IP。
+            if "IP冻结" in resp.text or "已被冻结" in resp.text:
+                raise IpBlockedError(
+                    "认证中心已冻结本机出口 IP（多次无效登录尝试所致），"
+                    "请等待解冻或联系管理员，期间重试没有意义"
+                )
             if resp.status_code == 200:
                 inputs = _parse_inputs(resp.text)
                 by_id: dict[str, str] = {}

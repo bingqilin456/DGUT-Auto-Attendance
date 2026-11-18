@@ -32,7 +32,14 @@ from pathlib import Path
 
 import requests
 
-from dgut_client import DgutError, XgxtClient, beijing_now
+from dgut_client import (
+    CaptchaRequiredError,
+    CredentialsRejectedError,
+    DgutError,
+    IpBlockedError,
+    XgxtClient,
+    beijing_now,
+)
 
 try:  # 节假日判断是可选增强，缺了也能正常打卡
     import chinese_calendar as _calendar
@@ -474,10 +481,20 @@ def main(argv: list[str] | None = None) -> int:
 
     client = XgxtClient(args.username, args.password)
     login_error: Exception | None = None
+    # 这三类错误重试只会得到同样结果：密码不被接受、必须人工过验证码、IP 被冻结。
+    # 2026-11-17 就是在这里空转了一整夜（失败 → 接力又排下一轮 → 再失败），
+    # 最后把出口 IP 也一起玩冻结了。
+    permanent = (CredentialsRejectedError, CaptchaRequiredError, IpBlockedError)
     for attempt in range(1, 4):
         try:
             client.login()
             login_error = None
+            break
+        except permanent as exc:
+            login_error = exc
+            log(f"[登录失败] {exc}")
+            log("[需要人工处理] 请更新仓库 Secrets 里的 USERNAME / PASSWORD，"
+                "或先手动登录一次解除验证码/IP 风控后再运行")
             break
         except DgutError as exc:
             login_error = exc
@@ -485,7 +502,10 @@ def main(argv: list[str] | None = None) -> int:
             if attempt < 3:
                 time.sleep(30)
     if login_error is not None:
-        log("[程序结束] 连续 3 次都没登上，本次运行放弃（没有产生任何考勤记录）")
+        if isinstance(login_error, permanent):
+            log("[程序结束] 凭证/IP 问题不会因重试而改变，本次运行放弃（没有产生任何考勤记录）")
+        else:
+            log("[程序结束] 连续 3 次都没登上，本次运行放弃（没有产生任何考勤记录）")
         return 1
     log("[登录成功]")
 

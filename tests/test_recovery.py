@@ -24,10 +24,10 @@ class VirtualClock:
 
 
 class TestMainRecovery(unittest.TestCase):
-    def run_main(self, now, outcomes=None, extra=(), client=None, plan=PLAN):
+    def run_main(self, now, outcomes=None, extra=(), client=None, plan=PLAN, login=None):
         clock = VirtualClock(now)
         client = client or FakeClient(signed_in=False)
-        client.login = Mock()
+        client.login = login if login is not None else Mock()
         with (
             patch.object(att, "beijing_naive", side_effect=lambda: clock.now),
             patch.object(att.time, "monotonic", side_effect=lambda: clock.elapsed),
@@ -50,6 +50,27 @@ class TestMainRecovery(unittest.TestCase):
     def test_once_failure_is_visible(self):
         result, _, _ = self.run_main(at(9), DgutError("network unavailable"), ("--once",))
         self.assertEqual(result, 1)
+
+    def test_rejected_credentials_fail_fast_without_burning_retries(self):
+        """密码被拒时不该再等 30 秒重试两次 —— 那只会把失败拖长并加重风控。"""
+        login = Mock(side_effect=att.CredentialsRejectedError("账号或密码错误"))
+        result, clock, _ = self.run_main(at(9), login=login)
+        self.assertEqual(result, 1)
+        self.assertEqual(login.call_count, 1)
+        self.assertEqual(clock.sleeps, [])
+
+    def test_frozen_ip_fails_fast(self):
+        login = Mock(side_effect=att.IpBlockedError("IP 已冻结"))
+        result, clock, _ = self.run_main(at(9), login=login)
+        self.assertEqual(result, 1)
+        self.assertEqual(login.call_count, 1)
+        self.assertEqual(clock.sleeps, [])
+
+    def test_transient_login_error_still_retries(self):
+        login = Mock(side_effect=[DgutError("timeout"), None])
+        result, _, _ = self.run_main(at(9), login=login)
+        self.assertEqual(result, 0)
+        self.assertEqual(login.call_count, 2)
 
     def test_final_checkout_retries_until_success(self):
         result, clock, calls = self.run_main(
