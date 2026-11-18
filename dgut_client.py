@@ -302,7 +302,12 @@ class XgxtClient:
         if resp.status_code != 200:
             raise LoginError(f"中央认证登录失败：HTTP {resp.status_code}")
         if _looks_like_login_page(resp):
-            raise LoginError("登录后仍停留在认证页，学工系统会话未建立")
+            # 带上现场信息：区分「票据写回了登录页」「会话失效」和「被风控静默拦下」。
+            raise LoginError(
+                "登录后仍停留在认证页，学工系统会话未建立"
+                f"（HTTP {resp.status_code}，最终地址 {resp.url}，"
+                f"{len(resp.text)} 字节，提示 {tip or '无'}）"
+            )
         self.logged_in = True
 
     def _fetch_login_form(self, login_url: str) -> tuple[list[dict[str, Any]], dict[str, str]]:
