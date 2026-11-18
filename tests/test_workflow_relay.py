@@ -149,6 +149,26 @@ class TestRelayCircuitBreaker(unittest.TestCase):
         self.assertTrue(relay.enqueue_next_run(environ=ENV, now=at(12)))
         self.post.assert_called_once()
 
+    def test_current_run_does_not_crowd_out_the_failure_history(self):
+        """线上真实形态：列表第 1 条是本轮(queued)、第 2 条是上一轮排的后继(queued)，
+        真正完成的失败记录被挤到后面。若只按阈值取 per_page，熔断永远判不出来。"""
+        runs = [
+            {"status": "queued", "conclusion": None},
+            {"status": "queued", "conclusion": None},
+            {"status": "completed", "conclusion": "failure"},
+            {"status": "completed", "conclusion": "failure"},
+            {"status": "completed", "conclusion": "failure"},
+        ]
+        self.get.return_value = Mock(status_code=200, json=lambda: {"workflow_runs": runs})
+        self.assertFalse(relay.enqueue_next_run(environ=ENV, now=at(12)))
+        self.post.assert_not_called()
+
+    def test_history_query_asks_for_more_than_the_threshold(self):
+        self.history("failure", "failure", "failure")
+        relay.enqueue_next_run(environ=ENV, now=at(12))
+        self.assertGreater(self.get.call_args.kwargs["params"]["per_page"],
+                           relay.MAX_CONSECUTIVE_FAILURES)
+
 
 class TestWorkflowRelayConfig(unittest.TestCase):
     def test_successor_is_queued_before_attendance_starts(self):

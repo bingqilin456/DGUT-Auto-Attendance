@@ -14,10 +14,13 @@ from attendance import BASE_DIR, beijing_naive, get_config, log, resolve_today_p
 # 连续这么多轮都失败就不再接力 —— 足以排除偶发的网络抖动，又不会把
 # 一次凭证错误放大成通宵空转。
 MAX_CONSECUTIVE_FAILURES = 3
+# 取历史时多要几条：列表里会同时含「本轮(排队/运行中)」和「上一轮排下的后继」，
+# 只按 MAX_CONSECUTIVE_FAILURES 取会挤掉真正完成的记录，让熔断永远判不出来。
+_HISTORY_QUERY_SIZE = MAX_CONSECUTIVE_FAILURES + 5
 
 
 def _recent_runs_keep_failing(repository: str, token: str) -> bool:
-    """最近 ``MAX_CONSECUTIVE_FAILURES`` 轮是否全部失败。
+    """最近 ``MAX_CONSECUTIVE_FAILURES`` 轮**已完成**的运行是否全部失败。
 
     查不到历史时返回 ``False`` —— 宁可多排一轮，也不要因为 API 抽风漏掉考勤。
     """
@@ -28,7 +31,7 @@ def _recent_runs_keep_failing(repository: str, token: str) -> bool:
             headers={"Authorization": f"Bearer {token}",
                      "Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28"},
-            params={"per_page": MAX_CONSECUTIVE_FAILURES},
+            params={"per_page": _HISTORY_QUERY_SIZE},
             timeout=30,
         )
         if response.status_code != 200:
@@ -37,11 +40,13 @@ def _recent_runs_keep_failing(repository: str, token: str) -> bool:
     except (requests.RequestException, ValueError):
         return False
 
-    # 本轮自己还在跑（status=in_progress），不计入判断。
+    # 只有 completed 才带 conclusion；本轮自己（queued/in_progress）必须排除，
+    # 否则还没跑完就被当成「失败」，或反过来把已完成记录挤出列表。
     finished = [r for r in runs if r.get("status") == "completed"]
     if len(finished) < MAX_CONSECUTIVE_FAILURES:
         return False
-    return all(r.get("conclusion") == "failure" for r in finished)
+    return all(r.get("conclusion") == "failure"
+               for r in finished[:MAX_CONSECUTIVE_FAILURES])
 
 
 def enqueue_next_run(*, environ: Mapping[str, str] | None = None,
